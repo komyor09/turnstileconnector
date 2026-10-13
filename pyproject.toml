@@ -1,0 +1,11 @@
+[project]
+name = "turnstileconnector"
+version = "0.1.0"
+description = "Коннектор: база ISU (binlog) → турникеты WG3000/ACB"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mysql-replication==0.45.1",   # 1.x требует binlog_row_metadata=FULL (MariaDB 10.5+), у нас 5.5
+    "pymysql>=1.1",
+    "setuptools",                  # 0.45 импортирует distutils, которого нет в Python 3.12
+]

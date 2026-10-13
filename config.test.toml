@@ -1,0 +1,37 @@
+# Конфиг для теста на своём ПК: тестовая база в Docker + эмулятор контроллеров.
+
+[db]
+host     = "127.0.0.1"
+port     = 3307                 # тестовая MariaDB 5.5 в Docker (чтобы не мешать вашей локальной на 3306)
+user     = "turnstile"
+password = "turnstile"
+database = "isu_test"
+charset  = "utf8"
+
+[sync]
+view         = "v_campus_students"   # вьюха: student_id, card_no, valid_from, valid_to
+dry_run      = false                 # true = только писать в лог, на контроллеры не отправлять
+max_attempts = 5
+retry_delays = [2, 5, 15, 60]        # пауза после 1-й..4-й неудачи, сек
+after_fail   = 60                    # после записи ошибки — повтор (в тесте раз в минуту)
+
+# Какие таблицы под вьюхой слушать в binlog и как из строки получить student_id:
+#   "колонка"   — student_id лежит прямо в строке
+#   "SELECT …"  — запрос, который по значениям строки вернёт затронутых студентов
+[watch]
+students = "id"
+
+[http]
+port  = 8090
+token = "test-token"
+
+# Эмулятор (fake_controller.py) слушает 127.0.0.1:60000 и отвечает за любой серийник.
+[[controllers]]
+sn    = 223218042
+ip    = "127.0.0.1"
+doors = [1, 2]                  # m002-1, m002-2
+
+[[controllers]]
+sn    = 123228092
+ip    = "127.0.0.1"
+doors = [1]                     # m003-1

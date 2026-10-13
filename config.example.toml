@@ -1,0 +1,34 @@
+# Шаблон боевого конфига. Скопируйте в config.toml (он в .gitignore — пароли в git не попадут).
+
+[db]
+host     = "IP-сервера-ISU"
+port     = 3306
+user     = "turnstile"
+password = "сложный-пароль"
+database = "isu"
+charset  = "utf8"
+
+[sync]
+view         = "v_campus_students"
+dry_run      = true             # ПЕРВЫЙ запуск — только true! Посмотреть лог, потом false.
+max_attempts = 5
+retry_delays = [2, 5, 15, 60]
+after_fail   = 3600
+
+[watch]
+students = "id"
+# groups = "SELECT id FROM students WHERE group_id = %(id)s"
+
+[http]
+port  = 8090
+token = "длинный-случайный-токен-латиницей"
+
+[[controllers]]
+sn    = 223218042
+ip    = "192.168.140.22"
+doors = [1, 2]                  # m002-1, m002-2
+
+[[controllers]]
+sn    = 123228092
+ip    = "192.168.140.13"
+doors = [1]                     # m003-1
