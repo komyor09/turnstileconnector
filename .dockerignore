@@ -1,0 +1,10 @@
+.venv
+.idea
+.git
+__pycache__
+config.toml
+config.test.toml
+*.sql
+README.md
+fake_controller.py
+uv.lock

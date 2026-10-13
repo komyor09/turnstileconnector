@@ -19,6 +19,8 @@ ISU (MariaDB) ──binlog──▶ connector.py ──UDP 60000──▶ кон
 | `fake_controller.py` | эмулятор контроллеров для теста без железа |
 | `test_data.sql` | тестовая база: таблица студентов + вьюха + пользователь |
 | `turnstile_connector.sql` | две служебные таблицы коннектора (и на тесте, и на бою) |
+| `turnstile_view.sql` | вьюха `v_turnstile_xobgoh` поверх `view_xobgoh_resident` (бой) |
+| `Dockerfile`, `docker-compose.yml` | запуск на Ubuntu Server в Docker |
 
 ---
 
@@ -202,119 +204,143 @@ Invoke-RestMethod -Method Post http://localhost:8090/sync -Headers @{Authorizati
 
 ---
 
-# Часть 2. Внедрение
+# Часть 2. Внедрение (Ubuntu Server + Docker)
+
+## Сервер для коннектора
+
+Коннектор лёгкий: ~50 МБ памяти, процессор почти не использует.
+
+| | Минимум | Удобно |
+|---|---|---|
+| ОС | Ubuntu Server 22.04 / 24.04 LTS | |
+| CPU | 1 vCPU | 1 vCPU |
+| RAM | 512 МБ | 1 ГБ |
+| Диск | 10 ГБ | 20 ГБ |
+
+Главное — сеть:
+- **статический IP** (по нему выдаются права в базе);
+- доступ к серверу базы по **TCP 3306**;
+- доступ к контроллерам **192.168.140.22 и .13 по UDP 60000**;
+- порт 8090 снаружи открывать только если вебхук будут вызывать с других машин.
+
+На сервере нужны Docker Engine и плагин compose (`docker compose version`).
 
 ## Шаг 1. Бэкап
 
 ```
-mysqldump -u root -p --single-transaction --routines isu > isu_backup_YYYYMMDD.sql
+mysqldump -u root -p --single-transaction --routines <база> > isu_backup_$(date +%F).sql
 ```
-И скопируйте базу N3000 `iCCard3000.mdb` — это текущее состояние прав на турникетах.
+И копия `iCCard3000.mdb` из N3000.
 
-## Шаг 2. Включить binlog на сервере ISU
+## Шаг 2. Включить binlog на сервере базы
 
-Нужен **перезапуск MariaDB** — выберите время, когда ISU можно остановить на пару минут.
+Сейчас `log_bin = OFF`, поэтому нужен **перезапуск MariaDB** (2–3 минуты простоя ISU).
 
-В `my.ini` (Windows, обычно в папке `data` MariaDB) или `/etc/mysql/my.cnf` (Linux), секция `[mysqld]`:
+В `my.cnf` (`/etc/mysql/my.cnf` на Linux, `my.ini` на Windows), секция `[mysqld]`:
 ```
 server-id        = 1
 log_bin          = mysql-bin
 binlog_format    = ROW
 expire_logs_days = 7
 ```
-- `expire_logs_days` — чтобы старые binlog-файлы удалялись и не съели диск;
-- если на сервере уже есть репликация и `server-id` задан — оставьте существующий.
+Проверьте там же `bind-address`: если `127.0.0.1`, база не примет подключение с сервера коннектора — нужно поставить IP сервера базы или `0.0.0.0` (с ограничением доступа брандмауэром).
 
-Перезапустите MariaDB и проверьте:
-```
-SHOW MASTER STATUS;                    -- строка с mysql-bin.000001
-SHOW VARIABLES LIKE 'binlog_format';   -- ROW
-```
-Потом проверьте, что ISU работает как обычно.
-
-## Шаг 3. Таблицы и пользователь
-
-```
-mysql -u root -p isu < turnstile_connector.sql
-```
-Затем права (подставьте IP машины, где будет коннектор, и пароль):
+Перезапуск и проверка:
 ```sql
-GRANT SELECT ON isu.* TO 'turnstile'@'IP_КОННЕКТОРА' IDENTIFIED BY 'пароль';
-GRANT INSERT, UPDATE, DELETE ON isu.turnstile_synced TO 'turnstile'@'IP_КОННЕКТОРА';
-GRANT INSERT, UPDATE ON isu.turnstile_errors TO 'turnstile'@'IP_КОННЕКТОРА';
+SHOW VARIABLES LIKE 'log_bin';         -- ON
+SHOW VARIABLES LIKE 'binlog_format';   -- ROW
+SHOW MASTER STATUS;                    -- mysql-bin.000001 | ...
+```
+Убедитесь, что ISU работает.
+
+## Шаг 3. Таблицы, вьюха, пользователь
+
+```
+mysql -u root -p <база> < turnstile_connector.sql
+mysql -u root -p <база> < turnstile_view.sql
+```
+`turnstile_view.sql` создаёт `v_turnstile_xobgoh` поверх существующей `view_xobgoh_resident` (её не трогаем — она нужна для выгрузки в N3000). Даты берутся оттуда же, так что источник правды один.
+
+Права (IP — сервера коннектора):
+```sql
+GRANT SELECT ON <база>.* TO 'turnstile'@'IP_КОННЕКТОРА' IDENTIFIED BY 'пароль';
+GRANT INSERT, UPDATE, DELETE ON <база>.turnstile_synced TO 'turnstile'@'IP_КОННЕКТОРА';
+GRANT INSERT, UPDATE ON <база>.turnstile_errors TO 'turnstile'@'IP_КОННЕКТОРА';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'turnstile'@'IP_КОННЕКТОРА';
 FLUSH PRIVILEGES;
 ```
 
-## Шаг 4. Машина для коннектора
+## Шаг 4. Развернуть коннектор
 
-Подходит любая, которая **постоянно включена** и видит **и базу, и сеть 192.168.140.x** (можно сам сервер ISU).
-
-1. Скопируйте папку проекта, например в `C:\TurnstileConnector`.
-2. Установите uv и выполните в папке `uv sync`.
-3. `copy config.example.toml config.toml` и заполните: доступ к базе, вьюха, `[watch]` из шага 10 части 1, токен, IP контроллеров. **`dry_run = true`.**
+```
+git clone <репозиторий> /opt/turnstile-connector     # или скопировать папку
+cd /opt/turnstile-connector
+cp config.example.toml config.toml
+nano config.toml            # база, пароль, токен; dry_run = true
+chmod 600 config.toml
+docker compose build
+```
 
 ## Шаг 5. Проверка
 
 ```
-uv run connector.py config.toml --check
+docker compose run --rm turnstile-connector python connector.py /app/config.toml --check
 ```
-Сверьте: число строк во вьюхе ≈ числу студентов с доступом на кампус; оба контроллера отвечают.
+Ожидаемо: `вьюха v_turnstile_xobgoh: 281 строк, с картой 281`, `binlog … ROW — ок`, оба контроллера отвечают.
 
 ## Шаг 6. Пробный запуск (dry-run)
 
 ```
-uv run connector.py config.toml
+docker compose up -d
+docker compose logs -f
 ```
-В режиме `dry_run = true` на контроллеры **ничего не отправляется**, коннектор только пишет в лог, что сделал бы:
+С `dry_run = true` на контроллеры ничего не уходит, в логе:
 ```
-студент 1234: [DRY-RUN] на турникетах: нет  →  должно быть: карта 13158327 (2026-09-01 — 2030-06-01)
+студент 1234: [DRY-RUN] на турникетах: нет  →  должно быть: карта 13158327 (2026-10-01 — 2027-06-30)
 ```
-Проверьте выборочно 5–10 студентов: номер карты совпадает с N3000, даты правильные.
-Поменяйте что-нибудь у тестового студента в ISU — в логе должна сразу появиться строка про него.
-Остановите (Ctrl+C).
+Сверьте 5–10 жителей с N3000. Поменяйте что-нибудь у тестового жителя в ISU — строка про него должна появиться сразу.
 
 ## Шаг 7. Боевой запуск
 
-1. `dry_run = false` в `config.toml`.
-2. Запустите. Стартовая сверка зальёт всех студентов (≈ 2000 карт × 2 контроллера — около минуты).
-3. Проверьте своей картой и картой отчисленного тестового студента.
-4. `SELECT COUNT(*) FROM turnstile_synced` ≈ числу строк во вьюхе; `turnstile_errors` пустая.
-
-## Шаг 8. Установить как службу Windows (NSSM)
-
-Скачайте nssm.exe (nssm.cc) и выполните в консоли администратора:
 ```
-nssm install TurnstileConnector "C:\TurnstileConnector\.venv\Scripts\python.exe" "connector.py config.toml"
-nssm set TurnstileConnector AppDirectory C:\TurnstileConnector
-nssm set TurnstileConnector AppEnvironmentExtra PYTHONUNBUFFERED=1
-nssm set TurnstileConnector AppStdout C:\TurnstileConnector\logs\connector.log
-nssm set TurnstileConnector AppStderr C:\TurnstileConnector\logs\connector.log
-nssm set TurnstileConnector AppRotateFiles 1
-nssm set TurnstileConnector AppRotateBytes 10485760
-nssm set TurnstileConnector Start SERVICE_AUTO_START
-mkdir C:\TurnstileConnector\logs
-nssm start TurnstileConnector
+nano config.toml            # dry_run = false
+docker compose restart
+docker compose logs -f
 ```
-Служба стартует вместе с Windows и перезапускается, если упадёт. Лог — `logs\connector.log`.
+Стартовая сверка запишет 281 карту за несколько секунд. Проверьте своей картой и тестовой (удалите тестового жителя из списка — карта должна перестать работать, верните — снова работает).
 
-(Linux: systemd-юнит с `Restart=always`, `ExecStart=/opt/TurnstileConnector/.venv/bin/python connector.py config.toml`.)
+Контейнер с `restart: unless-stopped` поднимается сам после перезагрузки сервера и при падении.
 
-## Шаг 9. N3000
+## Шаг 8. N3000
 
-С этого момента **не нажимайте в N3000 загрузку прав на контроллеры** — она перезапишет их своим списком, без студентов.
-N3000 оставляем для журнала проходов и для карт сотрудников (пока их не перенесли в ISU).
-Если всё-таки нажали — `POST /sync {"all": true, "force": true}` (или перезапуск с `--force`) заново запишет всех студентов. Обычный `{"all": true}` не поможет: он сверяет вьюху с `turnstile_synced`, а не с памятью контроллера.
+С этого момента **не нажимайте в N3000 загрузку прав на контроллеры** — она перезапишет их своим списком.
+Если всё-таки нажали:
+```
+curl -X POST http://localhost:8090/sync -H "Authorization: Bearer <токен>" -d '{"all":true,"force":true}'
+```
+Обычный `{"all": true}` не поможет: он сверяет вьюху с `turnstile_synced`, а не с памятью контроллера.
 
-## Шаг 10. Наблюдение
+## Шаг 9. Наблюдение
 
-- Открытые ошибки: `SELECT * FROM turnstile_errors WHERE resolved_at IS NULL`
-- Состояние: `curl.exe http://localhost:8090/health`
-- Лог: `logs\connector.log`
+- Ошибки: `SELECT * FROM turnstile_errors WHERE resolved_at IS NULL`
+- Состояние: `curl http://localhost:8090/health`, `docker ps` (колонка STATUS — healthy)
+- Лог: `docker compose logs --since 1h`
 
 Первую неделю смотрите `turnstile_errors` каждый день.
 
+## Как коннектор видит изменения в `_____list_xobgoh`
+
+- INSERT / UPDATE / DELETE — по каждой строке сразу;
+- `TRUNCATE` (если список перезаливается целиком) — полная сверка через 5 сек после него;
+- изменение вьюх (`CREATE OR REPLACE VIEW`, например новые даты на следующий год) — тоже полная сверка.
+
+## Обновление
+
+```
+cd /opt/turnstile-connector && git pull && docker compose build && docker compose up -d
+```
+
 ## Откат
 
-`nssm stop TurnstileConnector` — и всё работает как раньше через N3000. Карты, уже записанные коннектором, остаются на контроллерах.
+`docker compose down` — и всё работает как раньше через N3000. Записанные карты остаются на контроллерах.
 Binlog можно оставить включённым — ISU он не мешает.

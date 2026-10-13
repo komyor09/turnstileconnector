@@ -1,34 +1,36 @@
-# Шаблон боевого конфига. Скопируйте в config.toml (он в .gitignore — пароли в git не попадут).
+# Боевой конфиг. Скопируйте в config.toml (он в .gitignore — пароли в git не попадут).
 
 [db]
-host     = "IP-сервера-ISU"
+host     = "IP-сервера-базы"
 port     = 3306
 user     = "turnstile"
 password = "сложный-пароль"
-database = "isu"
+database = "имя-базы-ISU"
 charset  = "utf8"
 
 [sync]
-view         = "v_campus_students"
-dry_run      = true             # ПЕРВЫЙ запуск — только true! Посмотреть лог, потом false.
+view         = "v_turnstile_xobgoh"       # создаётся из turnstile_view.sql поверх view_xobgoh_resident
+dry_run      = true                       # ПЕРВЫЙ запуск — только true! Посмотреть лог, потом false.
 max_attempts = 5
 retry_delays = [2, 5, 15, 60]
 after_fail   = 3600
+# TRUNCATE / ALTER / CREATE VIEW по этим именам → полная сверка (таблицы из [watch] добавляются сами)
+resync_on    = ["view_xobgoh_resident", "v_turnstile_xobgoh"]
 
+# Таблица под вьюхой и колонка со student_id
 [watch]
-students = "id"
-# groups = "SELECT id FROM students WHERE group_id = %(id)s"
+_____list_xobgoh = "student_id"
 
 [http]
-port  = 8090
+port  = 8090                              # если меняете — поменяйте и HEALTHCHECK в Dockerfile
 token = "длинный-случайный-токен-латиницей"
 
 [[controllers]]
 sn    = 223218042
-ip    = "192.168.140.22"
-doors = [1, 2]                  # m002-1, m002-2
+ip    = "192.168.140.22"                  # сверьте с новой настройкой N3000
+doors = [1, 2]
 
 [[controllers]]
 sn    = 123228092
 ip    = "192.168.140.13"
-doors = [1]                     # m003-1
+doors = [1]

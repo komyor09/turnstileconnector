@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pymysql
 from pymysqlreplication import BinLogStreamReader
+from pymysqlreplication.event import QueryEvent
 from pymysqlreplication.row_event import DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent
 
 log = logging.getLogger("turnstile")
@@ -24,6 +25,7 @@ log = logging.getLogger("turnstile")
 DB: dict = {}
 VIEW = ""
 WATCH: dict = {}
+RESYNC_ON: list = []   # имена таблиц/вьюх: TRUNCATE/ALTER/CREATE по ним → полная сверка
 DRY_RUN = False
 MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL = 5, [2, 5, 15, 60], 3600
 HTTP_PORT, HTTP_TOKEN = 8090, ""
@@ -31,7 +33,7 @@ controllers: list = []
 
 
 def load_config(path):
-    global DB, VIEW, WATCH, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_PORT, HTTP_TOKEN, controllers
+    global DB, VIEW, WATCH, RESYNC_ON, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_PORT, HTTP_TOKEN, controllers
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     DB = cfg["db"]
@@ -41,6 +43,7 @@ def load_config(path):
     RETRY_DELAYS = s.get("retry_delays", [2, 5, 15, 60])
     AFTER_FAIL = s.get("after_fail", 3600)
     WATCH = cfg["watch"]
+    RESYNC_ON = [n.lower() for n in list(WATCH) + s.get("resync_on", [])]
     HTTP_PORT, HTTP_TOKEN = cfg["http"]["port"], cfg["http"]["token"]
     controllers = [Controller(c["sn"], c["ip"], {d: 1 for d in c["doors"]}, c.get("port", 60000))
                    for c in cfg["controllers"]]
@@ -168,9 +171,14 @@ def alive_conn(conn):
 
 
 def as_date(v, default):
-    if v is None:
+    """Дата из вьюхи: DATE, DATETIME или строка '2026-10-01' (если во вьюхе даты заданы константой)."""
+    if v is None or v == "":
         return default
-    return v.date() if isinstance(v, datetime) else v
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, (str, bytes)):
+        return date.fromisoformat((v.decode() if isinstance(v, bytes) else v)[:10])
+    return v
 
 
 def sync_student(cur, sid, force=False):
@@ -257,9 +265,20 @@ def binlog_listener(log_file, log_pos):
                 connection_settings={k: DB[k] for k in ("host", "port", "user", "password")},
                 server_id=4242,                                  # любой номер, не равный server-id базы
                 only_schemas=[DB["database"]], only_tables=list(WATCH),
-                only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent],
+                only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, QueryEvent],
                 log_file=log_file, log_pos=log_pos, resume_stream=True, blocking=True)
             for ev in stream:
+                if isinstance(ev, QueryEvent):
+                    # В режиме ROW сюда попадают только DDL и TRUNCATE (BEGIN/COMMIT пропускаем).
+                    # TRUNCATE не даёт построчных событий, поэтому по нему — полная сверка.
+                    q = ev.query.strip().lower()
+                    if q not in ("begin", "commit") and any(n in q for n in RESYNC_ON):
+                        log.info("binlog: «%s» — полная сверка через 5 сек", ev.query.strip()[:120])
+                        enqueue_all(delay=5)
+                    log_file, log_pos = stream.log_file, stream.log_pos
+                    continue
+                if ev.table not in WATCH:
+                    continue
                 rule = WATCH[ev.table]
                 for row in ev.rows:
                     versions = [row["before_values"], row["after_values"]] if "after_values" in row else [row["values"]]
@@ -322,7 +341,7 @@ class Webhook(BaseHTTPRequestHandler):
         log.debug(fmt, *args)
 
 
-def enqueue_all(force=False):
+def enqueue_all(force=False, delay=0.0):
     """Полная сверка: все из вьюхи + все, что уже стоит на турникетах.
     force=True — переписать все карты на контроллерах заново (≈ минута на 2000 студентов)."""
     with connect() as conn, conn.cursor() as cur:
@@ -331,7 +350,7 @@ def enqueue_all(force=False):
     for sid in ids:
         if force:
             forced.add(int(sid))
-        queue.add(int(sid))
+        queue.add(int(sid), delay=delay)
     return len(ids)
 
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================

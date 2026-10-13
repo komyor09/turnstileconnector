@@ -1,0 +1,16 @@
+services:
+  turnstile-connector:
+    build: .
+    image: turnstile-connector:latest
+    container_name: turnstile-connector
+    restart: unless-stopped
+    # host-сеть: UDP к контроллерам и TCP к базе идут напрямую с IP сервера, без NAT Docker
+    network_mode: host
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - /etc/localtime:/etc/localtime:ro       # время в логах = время сервера
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
