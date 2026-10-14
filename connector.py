@@ -9,8 +9,9 @@
     uv run connector.py config.test.toml            # работать
     uv run connector.py config.test.toml --check    # только проверить базу и контроллеры
     uv run connector.py config.toml --force         # при старте переписать все карты на контроллерах заново
+    uv run connector.py config.toml --selftest 99999999   # проверить протокол на настоящем контроллере тестовой картой
 """
-import heapq, importlib.metadata, itertools, json, logging, socket, struct, sys, threading, time, tomllib
+import heapq, importlib.metadata, itertools, json, logging, os, socket, struct, sys, threading, time, tomllib
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -106,8 +107,15 @@ class Controller:
     def delete_card(self, card):
         self._call(0x52, struct.pack("<I", card))
 
+    def get_card(self, card):
+        """(card, from 'YYYYMMDD', to 'YYYYMMDD', doors) или None. Нет карты → контроллер возвращает номер 0."""
+        r = self._call(0x5A, struct.pack("<I", card))
+        if struct.unpack("<I", r[8:12])[0] != card:
+            return None
+        return card, r[12:16].hex(), r[16:20].hex(), list(r[20:24])
+
     def has_card(self, card):
-        return struct.unpack("<I", self._call(0x5A, struct.pack("<I", card))[8:12])[0] == card
+        return self.get_card(card) is not None
 
     def card_count(self):
         return struct.unpack("<I", self._call(0x58)[8:12])[0]
@@ -115,41 +123,50 @@ class Controller:
 # ============================ ОЧЕРЕДЬ ============================
 
 class Queue:
-    """Очередь студентов на синхронизацию. Новое событие по студенту отменяет его старый повтор."""
+    """Очередь студентов на синхронизацию.
+
+    Новое событие по студенту отменяет его старый повтор. Флаг force хранится в самой очереди
+    под тем же замком: если по студенту уже ждёт задача с force, новая задача его наследует,
+    и флаг не теряется, пока задача не будет выполнена.
+    """
 
     def __init__(self):
         self.heap, self.latest, self.cv, self.seq = [], {}, threading.Condition(), itertools.count()
 
-    def add(self, sid, attempt=0, delay=0.0):
+    def add(self, sid, attempt=0, delay=0.0, force=False):
         with self.cv:
+            prev = self.latest.get(sid)
+            force = force or (prev is not None and prev[1])
             tok = next(self.seq)
-            self.latest[sid] = tok
+            self.latest[sid] = (tok, force)
             heapq.heappush(self.heap, (time.monotonic() + delay, tok, sid, attempt))
             self.cv.notify()
 
     def get(self):
+        """Возвращает (sid, attempt, force)."""
         with self.cv:
             while True:
                 if self.heap:
                     due, tok, sid, attempt = self.heap[0]
-                    if self.latest.get(sid) != tok:          # устарело — было событие новее
+                    cur = self.latest.get(sid)
+                    if cur is None or cur[0] != tok:          # устарело — было событие новее
                         heapq.heappop(self.heap)
                         continue
                     wait = due - time.monotonic()
                     if wait <= 0:
                         heapq.heappop(self.heap)
                         del self.latest[sid]
-                        return sid, attempt
+                        return sid, attempt, cur[1]
                     self.cv.wait(wait)
                 else:
                     self.cv.wait()
 
     def size(self):
-        return len(self.latest)
+        with self.cv:
+            return len(self.latest)
 
 
 queue = Queue()
-forced: set = set()   # студенты, которых надо записать на контроллеры заново, даже если turnstile_synced «уже совпадает»
 
 # ============================ СИНХРОНИЗАЦИЯ ============================
 
@@ -206,42 +223,73 @@ def sync_student(cur, sid, force=False):
     if down:
         raise IOError("контроллер недоступен: " + ", ".join(down))
 
-    for c in controllers:
-        if have and (not want or have[0] != want[0]):
-            c.delete_card(have[0])                       # отчисление или перевыпуск
-        if want:
+    # 1) Сначала новая карта — на ВСЕ контроллеры, с проверкой. Если где-то не вышло, старую карту
+    #    не трогаем: студент сохраняет доступ по старой, задача повторится. put идемпотентен,
+    #    поэтому повтор после частичного сбоя просто допишет недостающий контроллер.
+    if want:
+        for c in controllers:
             c.put_card(*want)
             if not c.has_card(want[0]):
                 raise IOError(f"карта {want[0]} не появилась на контроллере {c.sn}")
+
+    # 2) Только потом убираем старую карту (выселение или перевыпуск) — если она больше никому не нужна.
+    old = have[0] if have and (not want or have[0] != want[0]) else None
+    if old and card_in_use_by_other(cur, old, sid):
+        log.warning("студент %s: карта %s теперь у другого жителя — с контроллеров не удаляю", sid, old)
+        old = None
+    if old:
+        for c in controllers:
+            c.delete_card(old)
 
     if want:
         cur.execute("INSERT INTO turnstile_synced (student_id, card_no, valid_from, valid_to)"
                     " VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE card_no = VALUES(card_no),"
                     " valid_from = VALUES(valid_from), valid_to = VALUES(valid_to)", (sid, *want))
-        return f"put {want[0]} ({want[1]} — {want[2]})" + (" [force]" if force and want == have else "")
+        return (f"put {want[0]} ({want[1]} — {want[2]})" + (f", старая карта {old} удалена" if old else "")
+                + (" [force]" if force and want == have else ""))
     cur.execute("DELETE FROM turnstile_synced WHERE student_id = %s", (sid,))
     return f"delete {have[0]}"
 
 
+def card_in_use_by_other(cur, card_no, sid):
+    """Карту перевыдали другому жителю? Тогда удалять её с контроллеров нельзя."""
+    cur.execute(f"SELECT 1 FROM {VIEW} WHERE card_no = %s AND student_id <> %s LIMIT 1", (card_no, sid))
+    return cur.fetchone() is not None
+
+
+DB_ERRORS = (pymysql.err.OperationalError, pymysql.err.InterfaceError)
+
+
 def worker():
-    conn = connect()
+    """Разбирает очередь. Подключение к базе — внутри обработки ошибок:
+    база недоступна → задача возвращается в очередь без траты попыток, пауза растёт до 60 сек."""
+    conn, db_backoff = None, 1
     while True:
-        sid, attempt = queue.get()
+        sid, attempt, force = queue.get()
         try:
-            conn = alive_conn(conn)
+            conn = alive_conn(conn) if conn else connect()
+            if db_backoff > 1:
+                log.info("база снова доступна")
+            db_backoff = 1
             with conn.cursor() as cur:
-                action = sync_student(cur, sid, force=sid in forced)
-                forced.discard(sid)
+                action = sync_student(cur, sid, force=force)
                 if action:
                     if not DRY_RUN:
                         resolve_errors(cur, sid)
                     log.info("студент %s: %s", sid, action)
+        except DB_ERRORS as e:
+            # База недоступна — это не ошибка турникета: попытку не считаем, ждём базу.
+            log.error("база недоступна (%s) — студент %s вернётся в очередь через %s сек", e, sid, db_backoff)
+            conn = None
+            queue.add(sid, attempt, db_backoff, force=force)
+            time.sleep(db_backoff)
+            db_backoff = min(db_backoff * 2, 60)
         except Exception as e:
             attempt += 1
             log.warning("студент %s: попытка %s — %s", sid, attempt, e)
             try:
                 if attempt == MAX_ATTEMPTS:
-                    conn = alive_conn(conn)
+                    conn = alive_conn(conn) if conn else connect()
                     with conn.cursor() as cur:
                         cur.execute(f"SELECT (SELECT card_no FROM {VIEW} WHERE student_id = %s AND card_no > 0 LIMIT 1) AS want,"
                                     " (SELECT card_no FROM turnstile_synced WHERE student_id = %s) AS have", (sid, sid))
@@ -250,14 +298,29 @@ def worker():
                     log.error("студент %s: записано в turnstile_errors", sid)
             except Exception as e2:
                 log.error("не смог записать ошибку: %s", e2)
+                conn = None
             delay = RETRY_DELAYS[attempt - 1] if attempt < MAX_ATTEMPTS else AFTER_FAIL
-            queue.add(sid, attempt, delay)
+            queue.add(sid, attempt, delay, force=force)
+
+
+def supervised(target, *args):
+    """Если фоновый поток всё-таки упал — завершаем процесс целиком, чтобы Docker/NSSM его перезапустили,
+    а не оставили «живой» сервис без worker или binlog."""
+    def run():
+        try:
+            target(*args)
+        except BaseException:
+            log.exception("поток %s упал — перезапуск процесса", target.__name__)
+        finally:
+            os._exit(1)
+    return threading.Thread(target=run, name=target.__name__, daemon=True)
+
 
 # ============================ ВХОД 1: BINLOG ============================
 
 def binlog_listener(log_file, log_pos):
     """Слушает binlog как реплика. Падает — переподключается с того же места."""
-    lookup = connect()
+    lookup = None
     while True:
         stream = None
         try:
@@ -267,6 +330,7 @@ def binlog_listener(log_file, log_pos):
                 only_schemas=[DB["database"]], only_tables=list(WATCH),
                 only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, QueryEvent],
                 log_file=log_file, log_pos=log_pos, resume_stream=True, blocking=True)
+            log.info("binlog: слушаю с %s:%s", log_file, log_pos)
             for ev in stream:
                 if isinstance(ev, QueryEvent):
                     # В режиме ROW сюда попадают только DDL и TRUNCATE (BEGIN/COMMIT пропускаем).
@@ -286,7 +350,7 @@ def binlog_listener(log_file, log_pos):
                         if " " not in rule:
                             sids = [values.get(rule)]
                         else:
-                            lookup = alive_conn(lookup)
+                            lookup = alive_conn(lookup) if lookup else connect()
                             with lookup.cursor() as cur:
                                 cur.execute(rule, values)
                                 sids = [next(iter(r.values())) for r in cur.fetchall()]
@@ -331,9 +395,7 @@ class Webhook(BaseHTTPRequestHandler):
         else:
             ids = [int(x) for x in body.get("student_ids", [])]
             for sid in ids:
-                if body.get("force"):
-                    forced.add(sid)
-                queue.add(sid)
+                queue.add(sid, force=bool(body.get("force")))
             n = len(ids)
         self._send(202, {"queued": n})
 
@@ -348,9 +410,7 @@ def enqueue_all(force=False, delay=0.0):
         cur.execute(f"SELECT student_id FROM {VIEW} UNION SELECT student_id FROM turnstile_synced")
         ids = [r["student_id"] for r in cur.fetchall()]
     for sid in ids:
-        if force:
-            forced.add(int(sid))
-        queue.add(int(sid), delay=delay)
+        queue.add(int(sid), delay=delay, force=force)
     return len(ids)
 
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================
@@ -399,16 +459,45 @@ def check_controllers():
     return ok
 
 
+def selftest(card):
+    """Проверка протокола на НАСТОЯЩЕМ контроллере тестовой картой, которой нет ни у кого:
+    записать → прочитать и сверить → удалить → убедиться, что удалена."""
+    today = date.today()
+    ok = True
+    for c in controllers:
+        try:
+            if c.has_card(card):
+                log.error("контроллер %s: карта %s уже есть — выберите номер, которого нет ни у кого", c.sn, card)
+                ok = False
+                continue
+            c.put_card(card, today, today)
+            got = c.get_card(card)
+            expect = (card, today.strftime("%Y%m%d"), today.strftime("%Y%m%d"), list(c.doors))
+            if got != expect:
+                raise IOError(f"записали {expect}, прочитали {got}")
+            c.delete_card(card)
+            if c.has_card(card):
+                raise IOError("карта не удалилась")
+            log.info("контроллер %s: запись, чтение, сверка и удаление карты %s — ок", c.sn, card)
+        except IOError as e:
+            log.error("контроллер %s: %s", c.sn, e)
+            ok = False
+    return ok
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         stream=sys.stdout)
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    args = [a for a in sys.argv[1:] if not a.startswith("--") and not a.isdigit()]
     load_config(args[0] if args else "config.toml")
 
     pos = check_db()
     ctrl_ok = check_controllers()
     if "--check" in sys.argv:
         raise SystemExit(0 if ctrl_ok else 1)
+    if "--selftest" in sys.argv:
+        card = int(sys.argv[sys.argv.index("--selftest") + 1])
+        raise SystemExit(0 if selftest(card) else 1)
     if DRY_RUN:
         log.warning("РЕЖИМ DRY-RUN: на контроллеры ничего не отправляется, только лог")
 
@@ -417,8 +506,8 @@ def main():
     force = "--force" in sys.argv
     log.info("стартовая сверка%s: %s студентов в очереди",
              " (--force: переписать все карты)" if force else "", enqueue_all(force))
-    threading.Thread(target=worker, daemon=True).start()
-    threading.Thread(target=binlog_listener, args=(pos["File"], pos["Position"]), daemon=True).start()
+    supervised(worker).start()
+    supervised(binlog_listener, pos["File"], pos["Position"]).start()
 
     log.info("вебхук: http://0.0.0.0:%s/sync", HTTP_PORT)
     ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Webhook).serve_forever()
