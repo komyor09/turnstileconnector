@@ -248,7 +248,9 @@ def sync_student(cur, sid, force=False):
         return (f"put {want[0]} ({want[1]} — {want[2]})" + (f", старая карта {old} удалена" if old else "")
                 + (" [force]" if force and want == have else ""))
     cur.execute("DELETE FROM turnstile_synced WHERE student_id = %s", (sid,))
-    return f"delete {have[0]}"
+    if old:
+        return f"delete {old}"
+    return f"снят с учёта, карта {have[0]} оставлена на контроллерах — перевыдана другому жителю"
 
 
 def card_in_use_by_other(cur, card_no, sid):
