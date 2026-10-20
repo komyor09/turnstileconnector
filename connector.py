@@ -541,6 +541,8 @@ def fetch_new_events(cur, c):
                     "память очищена или контроллер заменён; читаю с начала", c.sn, last, cursor)
         cursor = 0
         save_cursor(cur, c.sn, 0)
+        if push_enabled():
+            configure_listener(c)            # после сброса адрес push пропадает — вернуть сразу, не ждать 5 минут
 
     end = min(last, cursor + EVENTS["batch"])
     skipped = 0
@@ -561,6 +563,7 @@ def fetch_new_events(cur, c):
 def events_worker():
     """Один поток пишет события. База недоступна — ждёт без потери: номер в курсоре не двигается."""
     conn, backoff, next_time_sync = None, 1, 0.0
+    down: set = set()                       # контроллеры, о недоступности которых уже написали
     next_listener_check = time.monotonic() + 300
     while True:
         events_wake.clear()
@@ -574,8 +577,15 @@ def events_worker():
                 for c in controllers:
                     try:
                         more |= fetch_new_events(cur, c)
+                        if c.sn in down:
+                            down.discard(c.sn)
+                            log.info("проходы: контроллер %s снова отвечает", c.sn)
+                            if push_enabled():
+                                configure_listener(c)
                     except IOError as e:
-                        log.warning("проходы: %s", e)
+                        if c.sn not in down:    # пишем один раз, а не каждые poll_seconds
+                            down.add(c.sn)
+                            log.warning("проходы: %s — продолжу пробовать, напишу, когда ответит", e)
         except DB_ERRORS as e:
             log.error("проходы: база недоступна (%s) — повтор через %s сек", e, backoff)
             conn = None
@@ -593,7 +603,7 @@ def events_worker():
             next_time_sync = time.monotonic() + EVENTS["sync_time_hours"] * 3600
 
         # Контроллер заменили или сбросили — адрес push пропал. Раз в 5 минут проверяем и восстанавливаем.
-        if EVENTS["listener_address"] and EVENTS["listen_port"] and time.monotonic() >= next_listener_check:
+        if push_enabled() and time.monotonic() >= next_listener_check:
             configure_listeners()
             next_listener_check = time.monotonic() + 300
 
@@ -620,20 +630,28 @@ def push_listener():
                 events_wake.set()
 
 
-def configure_listeners():
-    """Указывает контроллерам, куда слать события. Перезаписывает прежнюю настройку (например, N3000)."""
+def push_enabled():
+    return bool(EVENTS.get("listener_address") and EVENTS.get("listen_port"))
+
+
+def configure_listener(c):
+    """Указывает контроллеру, куда слать события. Перезаписывает прежнюю настройку (например, N3000)."""
     addr, port = EVENTS["listener_address"], EVENTS["listen_port"]
+    try:
+        before = c.get_listener()
+        if before[:2] != (addr, port):
+            c.set_listener(addr, port, 0)
+            log.info("контроллер %s: push событий %s:%s (было %s:%s)", c.sn, addr, port, before[0], before[1])
+        after = c.get_listener()
+        if after[:2] != (addr, port):
+            log.error("контроллер %s: push не настроился, сейчас %s:%s", c.sn, after[0], after[1])
+    except IOError as e:
+        log.error("контроллер %s: настройка push — %s", c.sn, e)
+
+
+def configure_listeners():
     for c in controllers:
-        try:
-            before = c.get_listener()
-            if before[:2] != (addr, port):
-                c.set_listener(addr, port, 0)
-                log.info("контроллер %s: push событий %s:%s (было %s:%s)", c.sn, addr, port, before[0], before[1])
-            after = c.get_listener()
-            if after[:2] != (addr, port):
-                log.error("контроллер %s: push не настроился, сейчас %s:%s", c.sn, after[0], after[1])
-        except IOError as e:
-            log.error("контроллер %s: настройка push — %s", c.sn, e)
+        configure_listener(c)
 
 
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================
