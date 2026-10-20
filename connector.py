@@ -1,9 +1,15 @@
 """
 Коннектор «база → турникеты». Отдельный сервис, код проекта не трогает.
 
-Входы:  binlog MariaDB/MySQL (изменения строк приходят сразу) + HTTP-вебхук POST /sync
-Выход:  контроллеры WG3000 / ACB по UDP 60000
-Ошибки: после max_attempts неудач — строка в turnstile_errors, дальше повтор раз в after_fail сек.
+Две задачи:
+  1. Карты: база → турникеты.
+     Входы:  binlog MariaDB/MySQL (изменения строк приходят сразу) + HTTP-вебхук POST /sync
+     Выход:  контроллеры WG3000 / ACB по UDP 60000
+     Ошибки: после max_attempts неудач — строка в turnstile_errors, дальше повтор раз в after_fail сек.
+  2. Проходы: турникеты → база (секция [events] в конфиге).
+     Контроллер сам присылает пакет при каждом проходе (push на listen_port) — это «звонок».
+     По звонку и раз в poll_seconds коннектор читает новые события по номерам, начиная с последнего
+     сохранённого (turnstile_event_cursor), и пишет их в turnstile_events. Пропусков нет даже после простоя.
 
 Запуск:
     uv run connector.py config.test.toml            # работать
@@ -31,10 +37,11 @@ DRY_RUN = False
 MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL = 5, [2, 5, 15, 60], 3600
 HTTP_PORT, HTTP_TOKEN = 8090, ""
 controllers: list = []
+EVENTS: dict = {}      # секция [events]; пусто или enabled = false — проходы не читаются
 
 
 def load_config(path):
-    global DB, VIEW, WATCH, RESYNC_ON, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_PORT, HTTP_TOKEN, controllers
+    global DB, VIEW, WATCH, RESYNC_ON, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_PORT, HTTP_TOKEN, controllers, EVENTS
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     DB = cfg["db"]
@@ -50,6 +57,15 @@ def load_config(path):
                    for c in cfg["controllers"]]
     if len(RETRY_DELAYS) < MAX_ATTEMPTS - 1:
         raise SystemExit("retry_delays должен содержать max_attempts - 1 значений")
+    e = cfg.get("events", {})
+    EVENTS = {} if not e.get("enabled", False) else {
+        "listen_port": e.get("listen_port", 60001),            # 0 = без push, только опрос
+        "listener_address": e.get("listener_address", ""),     # IP коннектора для контроллеров; "" = не настраивать
+        "poll_seconds": e.get("poll_seconds", 30),
+        "history_on_first_start": e.get("history_on_first_start", False),
+        "sync_time_hours": e.get("sync_time_hours", 24),       # 0 = не трогать часы контроллеров
+        "batch": e.get("batch", 500),
+    }
 
 
 def log_error(cur, sid, card_no, action, error, attempts):
@@ -119,6 +135,53 @@ class Controller:
 
     def card_count(self):
         return struct.unpack("<I", self._call(0x58)[8:12])[0]
+
+    # --- события (проходы) ---
+
+    def status(self):
+        """Последний номер события, само событие и часы контроллера."""
+        r = self._call(0x20)
+        clock = None
+        try:   # дата yymmdd в 51..53, время HHMMSS в 37..39 (BCD)
+            clock = datetime.strptime("20" + r[51:54].hex() + r[37:40].hex(), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+        return {"last_index": struct.unpack("<I", r[8:12])[0], "event": parse_event(r), "clock": clock}
+
+    def get_event(self, index):
+        """Событие №index. None — такого нет; {"overwritten": True} — уже затёрто (память кольцевая)."""
+        return parse_event(self._call(0xB0, struct.pack("<I", index)))
+
+    def set_listener(self, ip, port, interval=0):
+        """Куда контроллеру слать события. interval=0 — только при событии, без периодических пакетов."""
+        r = self._call(0x90, socket.inet_aton(ip) + struct.pack("<H", port) + bytes([interval]))
+        return r[8] == 1
+
+    def get_listener(self):
+        r = self._call(0x92)
+        return socket.inet_ntoa(r[8:12]), struct.unpack("<H", r[12:14])[0], r[14]
+
+    def set_time(self, dt: datetime):
+        r = self._call(0x30, bytes.fromhex(dt.strftime("%Y%m%d%H%M%S")))
+        return bcd_datetime(r[8:15])
+
+
+def bcd_datetime(b):
+    try:
+        return datetime.strptime(b.hex(), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
+def parse_event(r):
+    """Поля события одинаковы в ответе статуса (0x20), чтения события (0xB0) и push-пакете."""
+    index = struct.unpack("<I", r[8:12])[0]
+    if index == 0:
+        return None
+    if r[12] == 0xFF:
+        return {"index": index, "overwritten": True}
+    return {"index": index, "type": r[12], "granted": r[13] == 1, "door": r[14], "direction": r[15],
+            "card": struct.unpack("<I", r[16:20])[0], "time": bcd_datetime(r[20:27]), "reason": r[27]}
 
 # ============================ ОЧЕРЕДЬ ============================
 
@@ -380,7 +443,8 @@ class Webhook(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._send(200, {"queue": queue.size(), "dry_run": DRY_RUN,
-                                    "controllers": {c.sn: c.alive() for c in controllers}})
+                                    "controllers": {c.sn: c.alive() for c in controllers},
+                                    "events": {"enabled": bool(EVENTS), "last_push": last_push}})
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -415,6 +479,163 @@ def enqueue_all(force=False, delay=0.0):
         queue.add(int(sid), delay=delay, force=force)
     return len(ids)
 
+# ============================ ПРОХОДЫ: ТУРНИКЕТЫ → БАЗА ============================
+
+events_wake = threading.Event()     # «звонок»: пришёл push или осталась недочитанная пачка
+last_push: dict = {}                # sn → время последнего push (для /health)
+DIRECTION = {1: "вход", 2: "выход"}
+
+
+def save_cursor(cur, sn, index):
+    cur.execute("INSERT INTO turnstile_event_cursor (controller_sn, last_index) VALUES (%s, %s)"
+                " ON DUPLICATE KEY UPDATE last_index = VALUES(last_index)", (sn, index))
+
+
+def store_event(cur, sn, ev):
+    cur.execute("SELECT student_id FROM turnstile_synced WHERE card_no = %s LIMIT 1", (ev["card"],))
+    r = cur.fetchone()
+    sid = r["student_id"] if r else None
+    cur.execute("INSERT IGNORE INTO turnstile_events (controller_sn, event_index, event_time, event_type, card_no,"
+                " student_id, door, direction, granted, reason) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (sn, ev["index"], ev["time"] or datetime(1970, 1, 1), ev["type"], ev["card"], sid,
+                 ev["door"], ev["direction"], int(ev["granted"]), ev["reason"]))
+    if ev["type"] == 1:
+        log.info("проход: карта %s%s, дверь %s, %s — %s (%s, №%s)", ev["card"],
+                 f" (студент {sid})" if sid else " (нет в списке)", ev["door"],
+                 DIRECTION.get(ev["direction"], ev["direction"]),
+                 "пропущен" if ev["granted"] else f"ОТКАЗ, код {ev['reason']}", ev["time"], ev["index"])
+    else:
+        log.info("событие контроллера %s: тип %s, дверь %s, код %s (№%s)", sn, ev["type"], ev["door"], ev["reason"], ev["index"])
+
+
+def same_event_as_stored(cur, c, index):
+    """Событие №index в контроллере — то же, что мы сохранили? Ловит сброс памяти, после которого
+    новых событий набралось больше, чем было прочитано (номер тогда не уменьшается)."""
+    cur.execute("SELECT event_time, card_no FROM turnstile_events WHERE controller_sn = %s AND event_index = %s"
+                " ORDER BY id DESC LIMIT 1", (c.sn, index))
+    row = cur.fetchone()
+    if row is None:                       # не с чем сравнить (история пропущена или событие было затёрто)
+        return True
+    ev = c.get_event(index)
+    if ev is None or ev.get("overwritten"):
+        return True
+    return (ev["time"] or datetime(1970, 1, 1)) == row["event_time"] and ev["card"] == row["card_no"]
+
+
+def fetch_new_events(cur, c):
+    """Дочитывает события контроллера c от сохранённого номера до последнего. Возвращает True, если осталось ещё."""
+    last = c.status()["last_index"]
+    cur.execute("SELECT last_index FROM turnstile_event_cursor WHERE controller_sn = %s", (c.sn,))
+    row = cur.fetchone()
+    if row is None:
+        start = 0 if EVENTS["history_on_first_start"] else last
+        save_cursor(cur, c.sn, start)
+        log.info("контроллер %s: первый запуск чтения проходов — %s", c.sn,
+                 "читаю всю историю из памяти контроллера" if EVENTS["history_on_first_start"]
+                 else f"старые события (до №{last}) пропускаю, читаю только новые")
+        cursor = start
+    else:
+        cursor = row["last_index"]
+    if last < cursor or (last > cursor > 0 and not same_event_as_stored(cur, c, cursor)):
+        log.warning("контроллер %s: события в памяти не совпадают с сохранёнными (сейчас до №%s, прочитано до №%s) — "
+                    "память очищена или контроллер заменён; читаю с начала", c.sn, last, cursor)
+        cursor = 0
+        save_cursor(cur, c.sn, 0)
+
+    end = min(last, cursor + EVENTS["batch"])
+    skipped = 0
+    for i in range(cursor + 1, end + 1):
+        ev = c.get_event(i)
+        if ev is None:
+            break
+        if ev.get("overwritten"):
+            skipped += 1
+        else:
+            store_event(cur, c.sn, ev)
+        save_cursor(cur, c.sn, i)
+    if skipped:
+        log.warning("контроллер %s: %s событий уже затёрты в памяти контроллера — пропущены", c.sn, skipped)
+    return end < last
+
+
+def events_worker():
+    """Один поток пишет события. База недоступна — ждёт без потери: номер в курсоре не двигается."""
+    conn, backoff, next_time_sync = None, 1, 0.0
+    next_listener_check = time.monotonic() + 300
+    while True:
+        events_wake.clear()
+        more = False
+        try:
+            conn = alive_conn(conn) if conn else connect()
+            if backoff > 1:
+                log.info("проходы: база снова доступна")
+            backoff = 1
+            with conn.cursor() as cur:
+                for c in controllers:
+                    try:
+                        more |= fetch_new_events(cur, c)
+                    except IOError as e:
+                        log.warning("проходы: %s", e)
+        except DB_ERRORS as e:
+            log.error("проходы: база недоступна (%s) — повтор через %s сек", e, backoff)
+            conn = None
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
+
+        if EVENTS["sync_time_hours"] and time.monotonic() >= next_time_sync:
+            for c in controllers:
+                try:
+                    c.set_time(datetime.now())
+                except IOError as e:
+                    log.warning("часы контроллера %s не выставлены: %s", c.sn, e)
+            log.info("часы контроллеров выставлены по серверу")
+            next_time_sync = time.monotonic() + EVENTS["sync_time_hours"] * 3600
+
+        # Контроллер заменили или сбросили — адрес push пропал. Раз в 5 минут проверяем и восстанавливаем.
+        if EVENTS["listener_address"] and EVENTS["listen_port"] and time.monotonic() >= next_listener_check:
+            configure_listeners()
+            next_listener_check = time.monotonic() + 300
+
+        if not more:
+            events_wake.wait(EVENTS["poll_seconds"])
+
+
+def push_listener():
+    """Принимает push-пакеты контроллеров. Сам ничего не пишет — будит events_worker,
+    а тот читает события по номерам. Так у push и опроса один путь записи и нет гонок."""
+    known = {c.sn for c in controllers}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", EVENTS["listen_port"]))
+    log.info("проходы: жду push от контроллеров на UDP %s", EVENTS["listen_port"])
+    while True:
+        try:
+            p, addr = s.recvfrom(1024)
+        except ConnectionResetError:          # Windows
+            continue
+        if len(p) >= 64 and p[0] == 0x17 and p[1] == 0x20:
+            sn = struct.unpack("<I", p[4:8])[0]
+            if sn in known:
+                last_push[sn] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                events_wake.set()
+
+
+def configure_listeners():
+    """Указывает контроллерам, куда слать события. Перезаписывает прежнюю настройку (например, N3000)."""
+    addr, port = EVENTS["listener_address"], EVENTS["listen_port"]
+    for c in controllers:
+        try:
+            before = c.get_listener()
+            if before[:2] != (addr, port):
+                c.set_listener(addr, port, 0)
+                log.info("контроллер %s: push событий %s:%s (было %s:%s)", c.sn, addr, port, before[0], before[1])
+            after = c.get_listener()
+            if after[:2] != (addr, port):
+                log.error("контроллер %s: push не настроился, сейчас %s:%s", c.sn, after[0], after[1])
+        except IOError as e:
+            log.error("контроллер %s: настройка push — %s", c.sn, e)
+
+
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================
 
 def check_db():
@@ -439,7 +660,8 @@ def check_db():
         cur.execute(f"SELECT COUNT(*) AS n, SUM(card_no > 0) AS with_card FROM {VIEW}")
         r = cur.fetchone()
         log.info("вьюха %s: %s строк, с картой %s", VIEW, r["n"], r["with_card"] or 0)
-        for t in ("turnstile_synced", "turnstile_errors"):
+        tables = ("turnstile_synced", "turnstile_errors") + (("turnstile_events", "turnstile_event_cursor") if EVENTS else ())
+        for t in tables:
             cur.execute(f"SELECT COUNT(*) AS n FROM {t}")
             log.info("таблица %s: %s строк", t, cur.fetchone()["n"])
     lib = int(importlib.metadata.version("mysql-replication").split(".")[0])
@@ -455,6 +677,11 @@ def check_controllers():
     for c in controllers:
         try:
             log.info("контроллер %s (%s): отвечает, карт в памяти: %s", c.sn, c.ip, c.card_count())
+            if EVENTS:
+                st, lst = c.status(), c.get_listener()
+                drift = f"{(st['clock'] - datetime.now()).total_seconds():+.0f} сек" if st["clock"] else "не прочитать"
+                log.info("контроллер %s: событий в памяти до №%s, часы %s (расхождение с сервером %s), push → %s:%s",
+                         c.sn, st["last_index"], st["clock"], drift, lst[0], lst[1])
         except IOError as e:
             log.error("%s", e)
             ok = False
@@ -510,6 +737,14 @@ def main():
              " (--force: переписать все карты)" if force else "", enqueue_all(force))
     supervised(worker).start()
     supervised(binlog_listener, pos["File"], pos["Position"]).start()
+
+    if EVENTS:
+        if EVENTS["listener_address"] and EVENTS["listen_port"]:
+            configure_listeners()
+        if EVENTS["listen_port"]:
+            supervised(push_listener).start()
+        supervised(events_worker).start()
+        log.info("проходы: включены (страховочная сверка раз в %s сек)", EVENTS["poll_seconds"])
 
     log.info("вебхук: http://0.0.0.0:%s/sync", HTTP_PORT)
     ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Webhook).serve_forever()
