@@ -16,7 +16,7 @@ ISU (MariaDB) ──binlog──▶ connector.py ──UDP 60000──▶ кон
 |---|---|
 | `connector.py` | сам коннектор |
 | `config.test.toml` | конфиг для теста на своём ПК |
-| `config.example.toml` | шаблон боевого конфига → копируется в `config.toml` |
+| `config.example.toml` | шаблон боевого конфига → копируется в `configвввв.toml` |
 | `fake_controller.py` | эмулятор контроллеров для теста без железа |
 | `test_data.sql` | тестовая база: таблица студентов + вьюха + пользователь |
 | `turnstile_connector.sql` | две служебные таблицы коннектора (и на тесте, и на бою) |

@@ -2,7 +2,7 @@
 .idea
 .git
 __pycache__
-config.toml
+configвввв.toml
 config.test.toml
 *.sql
 README.md

@@ -10,5 +10,5 @@ wheels/
 .venv
 
 # Боевой конфиг с паролями
-config.toml
+configвввв.toml
 logs/
