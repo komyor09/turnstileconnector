@@ -27,5 +27,4 @@ WHERE status = 'active';
 -- Пользователь коннектора. В тесте — права на всю тестовую базу,
 -- на бою права уже по таблицам (см. turnstile_connector.sql).
 GRANT SELECT, INSERT, UPDATE, DELETE ON isu_test.* TO 'turnstile'@'%' IDENTIFIED BY 'turnstile';
-GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'turnstile'@'%';
 FLUSH PRIVILEGES;

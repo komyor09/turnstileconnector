@@ -3,7 +3,7 @@
 [db]
 host     = "IP-сервера-базы"
 port     = 3306
-user     = "turnstile"
+user     = "turnstile"                    # отдельный пользователь, см. turnstile_connector.sql
 password = "сложный-пароль"
 database = "имя-базы-ISU"
 charset  = "utf8"
@@ -14,29 +14,31 @@ dry_run      = true                       # ПЕРВЫЙ запуск — тол
 max_attempts = 5
 retry_delays = [2, 5, 15, 60]
 after_fail   = 3600
-# TRUNCATE / ALTER / CREATE VIEW по этим именам → полная сверка (таблицы из [watch] добавляются сами)
-resync_on    = ["view_xobgoh_resident", "v_turnstile_xobgoh"]
+reconcile_at = "03:00"                    # ночная полная сверка — страховка, если изменение прошло мимо вебхука; "" — выкл.
 
-# Таблица под вьюхой и колонка со student_id
-[watch]
-_____list_xobgoh = "student_id"
-
-# Проходы: турникеты → база. Перед включением прочитайте README, раздел «Проходы».
-[events]
-enabled          = false          # включить после приёмки синхронизации карт
-listen_port      = 60001          # UDP-порт на сервере коннектора для push от контроллеров
-listener_address = "IP-сервера-коннектора"   # как его видят контроллеры из 192.168.140.x; "" = не перенастраивать контроллеры
-poll_seconds     = 30             # страховочная сверка; если push запрещён сетью — listen_port = 0 и poll_seconds = 1
-history_on_first_start = false    # старая история уже в базе через N3000 — не дублировать
-sync_time_hours  = 24             # часы контроллеров по серверу раз в сутки (0 = не трогать)
-
+# Вебхук: его вызывает ISU после изменения списка жильцов (php/turnstile_notify.php).
 [http]
-port  = 8090                              # если меняете — поменяйте и HEALTHCHECK в Dockerfile
-token = "длинный-случайный-токен-латиницей"
+bind  = "0.0.0.0"                         # слушать на всех адресах; доступ ограничивает брандмауэр (install_service.ps1)
+port  = 8090
+token = "длинный-случайный-токен-латиницей-от-16-символов"
+
+# Проходы: турникеты → база. Перед включением прочитайте README, часть 4.
+[events]
+enabled          = false                  # включить после приёмки синхронизации карт
+listen_port      = 60001                  # UDP-порт для push от контроллеров
+listener_address = "IP-этого-компьютера"  # как его видят контроллеры из 192.168.140.x; "" — не перенастраивать контроллеры
+poll_seconds     = 0                      # 0 — только по push; если push запрещён сетью: listen_port = 0, poll_seconds = 1
+history_on_first_start = false            # старая история уже в базе через N3000 — не дублировать
+sync_time_hours  = 24                     # часы контроллеров по серверу раз в сутки (0 — не трогать)
+
+[log]
+file   = "logs/connector.log"             # файл лога с ротацией
+max_mb = 10
+keep   = 10
 
 [[controllers]]
 sn    = 223218042
-ip    = "192.168.140.22"                  # сверьте с новой настройкой N3000
+ip    = "192.168.140.22"                  # сверьте с настройкой N3000
 doors = [1, 2]
 
 [[controllers]]

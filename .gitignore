@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
-# Боевой конфиг с паролями
-configвввв.toml
+# Боевые конфиги с паролями: любой config*.toml, кроме шаблона и тестового
+config*.toml
+!config.example.toml
+!config.test.toml
 logs/
+.python/
+tools/

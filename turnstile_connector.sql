@@ -50,11 +50,10 @@ CREATE TABLE IF NOT EXISTS turnstile_event_cursor (
     updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
--- Пользователь для коннектора: читать базу, писать свои таблицы, слушать binlog.
+-- Пользователь для коннектора: читать базу, писать свои таблицы.
 -- CREATE USER 'turnstile'@'<ip коннектора>' IDENTIFIED BY '...';
 -- GRANT SELECT ON isu.* TO 'turnstile'@'<ip>';
 -- GRANT INSERT, UPDATE, DELETE ON isu.turnstile_synced TO 'turnstile'@'<ip>';
 -- GRANT INSERT, UPDATE ON isu.turnstile_errors TO 'turnstile'@'<ip>';
 -- GRANT INSERT ON isu.turnstile_events TO 'turnstile'@'<ip>';
 -- GRANT INSERT, UPDATE ON isu.turnstile_event_cursor TO 'turnstile'@'<ip>';
--- GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'turnstile'@'<ip>';

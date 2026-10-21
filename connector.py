@@ -1,15 +1,17 @@
 """
-Коннектор «база → турникеты». Отдельный сервис, код проекта не трогает.
+Коннектор «база ↔ турникеты». Отдельный сервис (служба Windows).
 
 Две задачи:
   1. Карты: база → турникеты.
-     Входы:  binlog MariaDB/MySQL (изменения строк приходят сразу) + HTTP-вебхук POST /sync
+     Вход:   HTTP-вебхук POST /sync — его вызывает ISU после изменения списка жильцов.
+             Нет вызовов — коннектор базу не трогает. Плюс полная сверка при запуске и, по желанию,
+             раз в сутки (sync.reconcile_at) — на случай, если изменение прошло мимо вебхука.
      Выход:  контроллеры WG3000 / ACB по UDP 60000
      Ошибки: после max_attempts неудач — строка в turnstile_errors, дальше повтор раз в after_fail сек.
   2. Проходы: турникеты → база (секция [events] в конфиге).
      Контроллер сам присылает пакет при каждом проходе (push на listen_port) — это «звонок».
-     По звонку и раз в poll_seconds коннектор читает новые события по номерам, начиная с последнего
-     сохранённого (turnstile_event_cursor), и пишет их в turnstile_events. Пропусков нет даже после простоя.
+     По звонку коннектор читает новые события по номерам, начиная с последнего сохранённого
+     (turnstile_event_cursor), и пишет их в turnstile_events. Пропусков нет даже после простоя.
 
 Запуск:
     uv run connector.py config.test.toml            # работать
@@ -17,31 +19,29 @@
     uv run connector.py config.toml --force         # при старте переписать все карты на контроллерах заново
     uv run connector.py config.toml --selftest 99999999   # проверить протокол на настоящем контроллере тестовой картой
 """
-import heapq, importlib.metadata, itertools, json, logging, os, socket, struct, sys, threading, time, tomllib
-from datetime import date, datetime
+import heapq, itertools, json, logging, logging.handlers, os, socket, struct, sys, threading, time, tomllib
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pymysql
-from pymysqlreplication import BinLogStreamReader
-from pymysqlreplication.event import QueryEvent
-from pymysqlreplication.row_event import DeleteRowsEvent, UpdateRowsEvent, WriteRowsEvent
 
 log = logging.getLogger("turnstile")
 
 # Заполняется из config.toml в load_config()
 DB: dict = {}
 VIEW = ""
-WATCH: dict = {}
-RESYNC_ON: list = []   # имена таблиц/вьюх: TRUNCATE/ALTER/CREATE по ним → полная сверка
+RECONCILE_AT = ""      # "03:00" — полная сверка раз в сутки; "" — только при запуске
 DRY_RUN = False
 MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL = 5, [2, 5, 15, 60], 3600
-HTTP_PORT, HTTP_TOKEN = 8090, ""
+HTTP_BIND, HTTP_PORT, HTTP_TOKEN = "0.0.0.0", 8090, ""
+LOG: dict = {}
 controllers: list = []
 EVENTS: dict = {}      # секция [events]; пусто или enabled = false — проходы не читаются
 
 
 def load_config(path):
-    global DB, VIEW, WATCH, RESYNC_ON, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_PORT, HTTP_TOKEN, controllers, EVENTS
+    global DB, VIEW, RECONCILE_AT, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_BIND, HTTP_PORT, HTTP_TOKEN
+    global controllers, EVENTS, LOG
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     DB = cfg["db"]
@@ -50,22 +50,29 @@ def load_config(path):
     MAX_ATTEMPTS = s.get("max_attempts", 5)
     RETRY_DELAYS = s.get("retry_delays", [2, 5, 15, 60])
     AFTER_FAIL = s.get("after_fail", 3600)
-    WATCH = cfg["watch"]
-    RESYNC_ON = [n.lower() for n in list(WATCH) + s.get("resync_on", [])]
-    HTTP_PORT, HTTP_TOKEN = cfg["http"]["port"], cfg["http"]["token"]
+    RECONCILE_AT = s.get("reconcile_at", "")
+    if RECONCILE_AT:
+        datetime.strptime(RECONCILE_AT, "%H:%M")         # ошибка формата — сразу при запуске
+    h = cfg["http"]
+    HTTP_BIND, HTTP_PORT, HTTP_TOKEN = h.get("bind", "0.0.0.0"), h["port"], h["token"]
+    if len(HTTP_TOKEN) < 16:
+        raise SystemExit("http.token слишком короткий: нужно не меньше 16 символов")
+    LOG = cfg.get("log", {})
     controllers = [Controller(c["sn"], c["ip"], {d: 1 for d in c["doors"]}, c.get("port", 60000))
                    for c in cfg["controllers"]]
     if len(RETRY_DELAYS) < MAX_ATTEMPTS - 1:
         raise SystemExit("retry_delays должен содержать max_attempts - 1 значений")
     e = cfg.get("events", {})
     EVENTS = {} if not e.get("enabled", False) else {
-        "listen_port": e.get("listen_port", 60001),            # 0 = без push, только опрос
+        "listen_port": e.get("listen_port", 60001),            # 0 = без push (тогда нужен poll_seconds)
         "listener_address": e.get("listener_address", ""),     # IP коннектора для контроллеров; "" = не настраивать
-        "poll_seconds": e.get("poll_seconds", 30),
+        "poll_seconds": e.get("poll_seconds", 0),               # 0 = только по push, без периодической сверки
         "history_on_first_start": e.get("history_on_first_start", False),
         "sync_time_hours": e.get("sync_time_hours", 24),       # 0 = не трогать часы контроллеров
         "batch": e.get("batch", 500),
     }
+    if EVENTS and not EVENTS["listen_port"] and not EVENTS["poll_seconds"]:
+        raise SystemExit("events: без push (listen_port = 0) нужен poll_seconds > 0, иначе проходы не читаются")
 
 
 def log_error(cur, sid, card_no, action, error, attempts):
@@ -370,7 +377,7 @@ def worker():
 
 def supervised(target, *args):
     """Если фоновый поток всё-таки упал — завершаем процесс целиком, чтобы Docker/NSSM его перезапустили,
-    а не оставили «живой» сервис без worker или binlog."""
+    а не оставили «живой» сервис без нужного потока."""
     def run():
         try:
             target(*args)
@@ -381,56 +388,7 @@ def supervised(target, *args):
     return threading.Thread(target=run, name=target.__name__, daemon=True)
 
 
-# ============================ ВХОД 1: BINLOG ============================
-
-def binlog_listener(log_file, log_pos):
-    """Слушает binlog как реплика. Падает — переподключается с того же места."""
-    lookup = None
-    while True:
-        stream = None
-        try:
-            stream = BinLogStreamReader(
-                connection_settings={k: DB[k] for k in ("host", "port", "user", "password")},
-                server_id=4242,                                  # любой номер, не равный server-id базы
-                only_schemas=[DB["database"]], only_tables=list(WATCH),
-                only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, QueryEvent],
-                log_file=log_file, log_pos=log_pos, resume_stream=True, blocking=True)
-            log.info("binlog: слушаю с %s:%s", log_file, log_pos)
-            for ev in stream:
-                if isinstance(ev, QueryEvent):
-                    # В режиме ROW сюда попадают только DDL и TRUNCATE (BEGIN/COMMIT пропускаем).
-                    # TRUNCATE не даёт построчных событий, поэтому по нему — полная сверка.
-                    q = ev.query.strip().lower()
-                    if q not in ("begin", "commit") and any(n in q for n in RESYNC_ON):
-                        log.info("binlog: «%s» — полная сверка через 5 сек", ev.query.strip()[:120])
-                        enqueue_all(delay=5)
-                    log_file, log_pos = stream.log_file, stream.log_pos
-                    continue
-                if ev.table not in WATCH:
-                    continue
-                rule = WATCH[ev.table]
-                for row in ev.rows:
-                    versions = [row["before_values"], row["after_values"]] if "after_values" in row else [row["values"]]
-                    for values in versions:
-                        if " " not in rule:
-                            sids = [values.get(rule)]
-                        else:
-                            lookup = alive_conn(lookup) if lookup else connect()
-                            with lookup.cursor() as cur:
-                                cur.execute(rule, values)
-                                sids = [next(iter(r.values())) for r in cur.fetchall()]
-                        for sid in filter(None, sids):
-                            log.debug("binlog: %s.%s → студент %s", ev.schema, ev.table, sid)
-                            queue.add(int(sid))
-                log_file, log_pos = stream.log_file, stream.log_pos
-        except Exception as e:
-            log.error("binlog: %s — переподключение через 5 сек", e)
-            time.sleep(5)
-        finally:
-            if stream:
-                stream.close()
-
-# ============================ ВХОД 2: ВЕБХУК ============================
+# ============================ ВЕБХУК ============================
 
 class Webhook(BaseHTTPRequestHandler):
     def _send(self, code, body):
@@ -456,14 +414,28 @@ class Webhook(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
         except ValueError:
             return self._send(400, {"error": "bad json"})
+        if not isinstance(body, dict):
+            return self._send(400, {"error": "ожидается JSON-объект"})
+        force = bool(body.get("force"))
         if body.get("all"):
-            n = enqueue_all(force=bool(body.get("force")))
-        else:
-            ids = [int(x) for x in body.get("student_ids", [])]
-            for sid in ids:
-                queue.add(sid, force=bool(body.get("force")))
-            n = len(ids)
-        self._send(202, {"queued": n})
+            try:
+                n = enqueue_all(force=force)
+            except DB_ERRORS as e:
+                return self._send(503, {"error": f"база недоступна: {e}"})
+            log.info("вебхук: полная сверка%s, %s студентов", " (force)" if force else "", n)
+            return self._send(202, {"queued": n})
+        ids = body.get("student_ids")
+        if not isinstance(ids, list) or not ids:
+            return self._send(400, {"error": "нужно student_ids: [..] или all: true"})
+        try:
+            ids = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return self._send(400, {"error": "student_ids — только числа"})
+        for sid in ids:
+            queue.add(sid, force=force)
+        log.info("вебхук: студенты %s%s", ids if len(ids) <= 20 else f"{ids[:20]}… (всего {len(ids)})",
+                 " (force)" if force else "")
+        self._send(202, {"queued": len(ids)})
 
     def log_message(self, fmt, *args):
         log.debug(fmt, *args)
@@ -478,6 +450,20 @@ def enqueue_all(force=False, delay=0.0):
     for sid in ids:
         queue.add(int(sid), delay=delay, force=force)
     return len(ids)
+
+def nightly_reconcile():
+    """Раз в сутки в RECONCILE_AT — полная сверка (страховка, если изменение прошло мимо вебхука)."""
+    hh, mm = map(int, RECONCILE_AT.split(":"))
+    while True:
+        now = datetime.now()
+        at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if at <= now:
+            at += timedelta(days=1)
+        time.sleep((at - now).total_seconds())
+        try:
+            log.info("ночная сверка: %s студентов в очереди", enqueue_all())
+        except DB_ERRORS as e:
+            log.error("ночная сверка не выполнена — база недоступна: %s", e)
 
 # ============================ ПРОХОДЫ: ТУРНИКЕТЫ → БАЗА ============================
 
@@ -563,6 +549,9 @@ def fetch_new_events(cur, c):
 def events_worker():
     """Один поток пишет события. База недоступна — ждёт без потери: номер в курсоре не двигается."""
     conn, backoff, next_time_sync = None, 1, 0.0
+    poll = EVENTS["poll_seconds"]
+    if push_enabled():
+        configure_listeners()           # здесь, а не в main: недоступный контроллер не задерживает запуск вебхука
     down: set = set()                       # контроллеры, о недоступности которых уже написали
     next_listener_check = time.monotonic() + 300
     while True:
@@ -583,7 +572,7 @@ def events_worker():
                             if push_enabled():
                                 configure_listener(c)
                     except IOError as e:
-                        if c.sn not in down:    # пишем один раз, а не каждые poll_seconds
+                        if c.sn not in down:    # пишем один раз, а не при каждой попытке
                             down.add(c.sn)
                             log.warning("проходы: %s — продолжу пробовать, напишу, когда ответит", e)
         except DB_ERRORS as e:
@@ -608,7 +597,14 @@ def events_worker():
             next_listener_check = time.monotonic() + 300
 
         if not more:
-            events_wake.wait(EVENTS["poll_seconds"])
+            # Ждём push. Просыпаемся сами только к плановым делам с контроллерами
+            # (часы, проверка адреса push) и — если включено — к страховочной сверке.
+            deadlines = [next_listener_check] if push_enabled() else []
+            if EVENTS["sync_time_hours"]:
+                deadlines.append(next_time_sync)
+            if poll:
+                deadlines.append(time.monotonic() + poll)
+            events_wake.wait(max(0.0, min(deadlines) - time.monotonic()) if deadlines else None)
 
 
 def push_listener():
@@ -657,24 +653,12 @@ def configure_listeners():
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================
 
 def check_db():
-    """Проверяет binlog, права, вьюху и таблицы. Возвращает позицию binlog."""
+    """Проверяет подключение, вьюху и служебные таблицы."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT VERSION() AS v, @@hostname AS h, @@port AS p")
         r = cur.fetchone()
         log.info("база: %s (подключились к %s:%s, сервер %s, внутренний порт %s)",
                  r["v"], DB["host"], DB["port"], r["h"], r["p"])
-        cur.execute("SHOW VARIABLES LIKE 'log_bin'")
-        if cur.fetchone()["Value"] != "ON":
-            raise SystemExit("binlog выключен на этом сервере: нужен log_bin (my.ini или --log-bin)")
-        cur.execute("SHOW MASTER STATUS")
-        pos = cur.fetchone()
-        if not pos:
-            raise SystemExit(f"binlog включён, но у пользователя {DB['user']} нет права REPLICATION CLIENT")
-        cur.execute("SHOW VARIABLES LIKE 'binlog_format'")
-        if cur.fetchone()["Value"] != "ROW":
-            raise SystemExit("нужен binlog_format=ROW в my.ini")
-        cur.execute("SHOW VARIABLES LIKE 'binlog_row_metadata'")
-        meta = cur.fetchone()
         cur.execute(f"SELECT COUNT(*) AS n, SUM(card_no > 0) AS with_card FROM {VIEW}")
         r = cur.fetchone()
         log.info("вьюха %s: %s строк, с картой %s", VIEW, r["n"], r["with_card"] or 0)
@@ -682,12 +666,6 @@ def check_db():
         for t in tables:
             cur.execute(f"SELECT COUNT(*) AS n FROM {t}")
             log.info("таблица %s: %s строк", t, cur.fetchone()["n"])
-    lib = int(importlib.metadata.version("mysql-replication").split(".")[0])
-    if lib >= 1 and (not meta or meta["Value"] != "FULL"):
-        raise SystemExit("mysql-replication 1.x без binlog_row_metadata=FULL не видит колонки. "
-                         "Для MariaDB < 10.5: uv add mysql-replication==0.45.1 setuptools")
-    log.info("binlog: %s:%s, формат ROW — ок", pos["File"], pos["Position"])
-    return pos
 
 
 def check_controllers():
@@ -732,13 +710,33 @@ def selftest(card):
     return ok
 
 
+def setup_logging():
+    """Лог в консоль и, если задан [log] file, в файл с ротацией (для службы Windows)."""
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+    if LOG.get("file"):
+        os.makedirs(os.path.dirname(os.path.abspath(LOG["file"])), exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(LOG["file"], maxBytes=LOG.get("max_mb", 10) * 1024 * 1024,
+                                                  backupCount=LOG.get("keep", 10), encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        stream=sys.stdout)
+    if hasattr(sys.stdout, "reconfigure"):             # кириллица в консоли Windows и в логе службы
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))   # служба стартует в system32 — работаем из папки проекта
     args = [a for a in sys.argv[1:] if not a.startswith("--") and not a.isdigit()]
     load_config(args[0] if args else "config.toml")
+    setup_logging()
 
-    pos = check_db()
+    check_db()
     ctrl_ok = check_controllers()
     if "--check" in sys.argv:
         raise SystemExit(0 if ctrl_ok else 1)
@@ -748,24 +746,25 @@ def main():
     if DRY_RUN:
         log.warning("РЕЖИМ DRY-RUN: на контроллеры ничего не отправляется, только лог")
 
-    # Сначала запоминаем позицию binlog, потом сверяем всё — так ничего не теряется между ними,
-    # даже если коннектор был выключен (при старте он догоняет всё сам).
+    # При запуске — полная сверка: догоняем всё, что изменилось, пока коннектор был выключен
+    # или пока вызовы вебхука не доходили.
     force = "--force" in sys.argv
     log.info("стартовая сверка%s: %s студентов в очереди",
              " (--force: переписать все карты)" if force else "", enqueue_all(force))
     supervised(worker).start()
-    supervised(binlog_listener, pos["File"], pos["Position"]).start()
+    if RECONCILE_AT:
+        supervised(nightly_reconcile).start()
+        log.info("ночная сверка: каждый день в %s", RECONCILE_AT)
 
     if EVENTS:
-        if EVENTS["listener_address"] and EVENTS["listen_port"]:
-            configure_listeners()
         if EVENTS["listen_port"]:
             supervised(push_listener).start()
         supervised(events_worker).start()
-        log.info("проходы: включены (страховочная сверка раз в %s сек)", EVENTS["poll_seconds"])
+        log.info("проходы: включены (%s)", f"страховочная сверка раз в {EVENTS['poll_seconds']} сек"
+                 if EVENTS["poll_seconds"] else "только по push, без периодической сверки")
 
-    log.info("вебхук: http://0.0.0.0:%s/sync", HTTP_PORT)
-    ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Webhook).serve_forever()
+    log.info("вебхук: http://%s:%s/sync", HTTP_BIND, HTTP_PORT)
+    ThreadingHTTPServer((HTTP_BIND, HTTP_PORT), Webhook).serve_forever()
 
 
 if __name__ == "__main__":

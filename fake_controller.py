@@ -98,9 +98,6 @@ def run_emulator():
             p, addr = s.recvfrom(1024)
         except (socket.timeout, ConnectionResetError):  # тишина / Windows шумит после ответа закрытому сокету
             continue
-        except KeyboardInterrupt:
-            print("эмулятор остановлен")
-            break
 
         # --- проверка пакета: как у настоящего контроллера, на мусор он просто не отвечает
         if len(p) != 64 or p[0] != 0x17 or p[2:4] != b"\0\0":
@@ -179,4 +176,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "swipe":
         swipe_command()
     else:
-        run_emulator()
+        # Ctrl+C может прийти в любой строке цикла, не только во время recvfrom, — ловим снаружи
+        try:
+            run_emulator()
+        except KeyboardInterrupt:
+            print("эмулятор остановлен")
