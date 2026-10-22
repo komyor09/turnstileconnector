@@ -679,7 +679,8 @@ def check_controllers():
                 log.info("контроллер %s: событий в памяти до №%s, часы %s (расхождение с сервером %s), push → %s:%s",
                          c.sn, st["last_index"], st["clock"], drift, lst[0], lst[1])
         except IOError as e:
-            log.error("%s", e)
+            log.error("%s — если ping до %s проходит, проверьте серийный номер в N3000: "
+                      "на чужой серийник контроллер не отвечает", e, c.ip)
             ok = False
     return ok
 
