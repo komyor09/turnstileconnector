@@ -69,6 +69,7 @@ def load_config(path):
     EVENTS = {} if not e.get("enabled", False) else {
         "poll_seconds": e.get("poll_seconds", 2) or 2,          # период опроса контроллеров, сек (0 → 2)
         "history_on_first_start": e.get("history_on_first_start", False),
+        "mdb_path": e.get("mdb_path", ""),                      # файл N3000 Download для суточной сверки; "" — выкл.
     }
 
 
@@ -460,6 +461,12 @@ def nightly_reconcile():
             log.info("ночная сверка: %s студентов в очереди", enqueue_all())
         except DB_ERRORS as e:
             log.error("ночная сверка не выполнена — база недоступна: %s", e)
+        # Если задан файл N3000 Download — заодно добираем пропущенные проходы из него.
+        if EVENTS.get("mdb_path"):
+            try:
+                reconcile_events_mdb(EVENTS["mdb_path"])
+            except Exception as e:
+                log.error("ночная сверка проходов из файла не выполнена: %s", e)
 
 # ============================ ПРОХОДЫ: ТУРНИКЕТЫ → БАЗА ============================
 
@@ -570,6 +577,20 @@ def events_worker():
 # Короткий протокол не поддерживает push — события читаются поллингом (events_worker).
 
 
+def reconcile_events_mdb(path):
+    """Суточная сверка проходов из файла N3000 Download (Access .mdb) → turnstile_events.
+    Добавляет отсутствующие проходы, существующие пропускает (дедуп тем же ключом, что у
+    реал-тайма). Нужен pyodbc и Access-драйвер (есть там же, где N3000)."""
+    import mdb_reconcile
+    directions = {c.sn: c.directions for c in controllers}
+    known = {c.sn for c in controllers}
+    with connect() as conn:
+        rows = mdb_reconcile.read_swipes_odbc(path)
+        added, existed = mdb_reconcile.reconcile(conn, rows, directions, known_sns=known)
+    log.info("сверка из %s: добавлено %s проходов, уже было %s", path, added, existed)
+    return added
+
+
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================
 
 def check_db():
@@ -647,6 +668,13 @@ def main():
 
     check_db()
     load_controllers()
+    if "--reconcile" in sys.argv:          # разовая сверка проходов из файла N3000 Download и выход
+        i = sys.argv.index("--reconcile")
+        path = sys.argv[i + 1] if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--") \
+            else EVENTS.get("mdb_path", "")
+        if not path:
+            raise SystemExit("--reconcile: укажите путь к .mdb или задайте events.mdb_path в конфиге")
+        raise SystemExit(0 if reconcile_events_mdb(path) is not None else 1)
     ctrl_ok = check_controllers()
     if "--check" in sys.argv:
         raise SystemExit(0 if ctrl_ok else 1)
