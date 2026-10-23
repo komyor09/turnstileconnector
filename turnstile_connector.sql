@@ -1,5 +1,10 @@
+-- Таблицы коннектора вынесены в отдельную базу turnstile_db.
+-- Источник (view_xobgoh_resident и _____list_xobgoh) остаётся в базе ISU (kbtut_project) — его не трогаем.
 -- Можно выполнять повторно: существующие таблицы не трогаются, недостающие создаются.
 -- Совместимо с MariaDB 5.5 (DATETIME DEFAULT CURRENT_TIMESTAMP там нет — поэтому TIMESTAMP).
+
+CREATE DATABASE IF NOT EXISTS turnstile_db DEFAULT CHARSET=utf8;
+USE turnstile_db;
 
 -- Что уже стоит на турникетах (коннектор сравнивает с этим вьюху).
 CREATE TABLE IF NOT EXISTS turnstile_synced (
@@ -43,6 +48,25 @@ CREATE TABLE IF NOT EXISTS turnstile_events (
     KEY idx_time (event_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
+-- Контроллеры (турникеты). Коннектор берёт их отсюда; добавить новый — INSERT, без правки конфига.
+-- Если таблицы нет или она пуста — коннектор читает [[controllers]] из config.toml (обратная совместимость).
+CREATE TABLE IF NOT EXISTS turnstile_controllers (
+    sn         INT UNSIGNED PRIMARY KEY,                 -- серийник, как в N3000
+    ip         VARCHAR(45)  NOT NULL,
+    port       INT UNSIGNED NOT NULL DEFAULT 60000,
+    doors      VARCHAR(20)  NOT NULL DEFAULT '1,2',      -- какие двери открывать карте, список через запятую
+    dir1       VARCHAR(3)   NOT NULL DEFAULT 'in',       -- направление двери 1 для журнала: in / out
+    dir2       VARCHAR(3)   NOT NULL DEFAULT 'out',      -- направление двери 2
+    active     TINYINT(1)   NOT NULL DEFAULT 1,          -- 0 — коннектор контроллер игнорирует
+    note       VARCHAR(100) NULL,
+    updated_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- Текущая установка (пример; при пустой таблице берётся config.toml):
+-- INSERT INTO turnstile_controllers (sn, ip, doors, dir1, dir2) VALUES
+--   (222110572, '192.168.140.13', '1,2', 'in', 'out'),
+--   (222114632, '192.168.140.22', '1,2', 'in', 'out');
+
 -- До какого номера события уже прочитан каждый контроллер.
 CREATE TABLE IF NOT EXISTS turnstile_event_cursor (
     controller_sn INT UNSIGNED PRIMARY KEY,
@@ -50,10 +74,10 @@ CREATE TABLE IF NOT EXISTS turnstile_event_cursor (
     updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
--- Пользователь для коннектора: читать базу, писать свои таблицы.
+-- Пользователь для коннектора: читать источник в базе ISU, читать/писать свою базу turnstile_db.
+-- Коннектор подключается к turnstile_db (config.toml → database = "turnstile_db").
+-- Вьюхи в turnstile_db тянут источник из kbtut_project кросс-базово (их создаёт turnstile_view.sql).
 -- CREATE USER 'turnstile'@'<ip коннектора>' IDENTIFIED BY '...';
--- GRANT SELECT ON isu.* TO 'turnstile'@'<ip>';
--- GRANT INSERT, UPDATE, DELETE ON isu.turnstile_synced TO 'turnstile'@'<ip>';
--- GRANT INSERT, UPDATE ON isu.turnstile_errors TO 'turnstile'@'<ip>';
--- GRANT INSERT ON isu.turnstile_events TO 'turnstile'@'<ip>';
--- GRANT INSERT, UPDATE ON isu.turnstile_event_cursor TO 'turnstile'@'<ip>';
+-- GRANT SELECT ON kbtut_project.view_xobgoh_resident TO 'turnstile'@'<ip>';   -- источник (для вью)
+-- GRANT SELECT ON kbtut_project.`_____list_xobgoh`   TO 'turnstile'@'<ip>';   -- список для отчёта
+-- GRANT SELECT, INSERT, UPDATE, DELETE ON turnstile_db.* TO 'turnstile'@'<ip>';

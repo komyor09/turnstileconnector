@@ -5,11 +5,11 @@ host     = "IP-сервера-базы"
 port     = 3306
 user     = "turnstile"                    # отдельный пользователь, см. turnstile_connector.sql
 password = "сложный-пароль"
-database = "имя-базы-ISU"
+database = "turnstile_db"            # коннектор работает в своей базе; вьюхи в ней тянут источник из базы ISU
 charset  = "utf8"
 
 [sync]
-view         = "v_turnstile_xobgoh"       # создаётся из turnstile_view.sql поверх view_xobgoh_resident
+view         = "v_turnstile_xobgoh"       # в turnstile_db (turnstile_view.sql); тянет kbtut_project.view_xobgoh_resident
 dry_run      = true                       # ПЕРВЫЙ запуск — только true! Посмотреть лог, потом false.
 max_attempts = 5
 retry_delays = [2, 5, 15, 60]
@@ -22,26 +22,28 @@ bind  = "0.0.0.0"                         # слушать на всех адр�
 port  = 8090
 token = "длинный-случайный-токен-латиницей-от-16-символов"
 
-# Проходы: турникеты → база. Перед включением прочитайте README, часть 4.
+# Проходы: турникеты → база. Короткий протокол контроллеры не пушат — коннектор
+# опрашивает их сам (поллинг). Перед включением прочитайте README, часть 4.
 [events]
 enabled          = false                  # включить после приёмки синхронизации карт
-listen_port      = 60001                  # UDP-порт для push от контроллеров
-listener_address = "IP-этого-компьютера"  # как его видят контроллеры из 192.168.140.x; "" — не перенастраивать контроллеры
-poll_seconds     = 0                      # 0 — только по push; если push запрещён сетью: listen_port = 0, poll_seconds = 1
+poll_seconds     = 2                      # как часто опрашивать контроллеры, сек
 history_on_first_start = false            # старая история уже в базе через N3000 — не дублировать
-sync_time_hours  = 24                     # часы контроллеров по серверу раз в сутки (0 — не трогать)
 
 [log]
 file   = "logs/connector.log"             # файл лога с ротацией
 max_mb = 10
 keep   = 10
 
+# directions — направление по двери для журнала проходов: "in" (вход) / "out" (выход).
+# По умолчанию дверь 1 = "in", дверь 2 = "out" (как в текущей установке) — можно не указывать.
 [[controllers]]
 sn    = 123228092
 ip    = "192.168.140.22"                  # сверьте с настройкой N3000
 doors = [1, 2]
+directions = { 1 = "in", 2 = "out" }
 
 [[controllers]]
 sn    =  223218042
 ip    = "192.168.140.13"
-doors = [1]
+doors = [1, 2]
+directions = { 1 = "in", 2 = "out" }

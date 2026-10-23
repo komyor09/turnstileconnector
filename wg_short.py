@@ -135,6 +135,76 @@ def _ack_ok(req: bytes, info: dict, serial: int, counter: int) -> bool:
                 and info["serial"] == serial and info["counter"] == counter)
 
 
+# ------------------------------------------------------------------ события
+DOOR_BY_BYTE = {0x10: 1, 0x18: 2}       # байт двери в записи → номер двери
+_REC_OFF, _REC = 64, 20                 # записи в ответе: с офсета 64, по 20 байт
+
+
+def dec_time(w: int) -> tuple[int, int, int]:
+    """Упаковка времени: (час<<11)|(мин<<5)|сек."""
+    return w >> 11, (w >> 5) & 0x3F, w & 0x1F
+
+
+def build_events(serial: int, counter: int) -> bytes:
+    """Запрос последних записей проходов (fn 0x20, 28 Б) — как Monitor в N3000."""
+    return build_status(serial, counter)
+
+
+def build_latest_index(serial: int, counter: int) -> bytes:
+    """fn 0x80 — вернуть номер последней записи (28 Б)."""
+    p = bytearray(28)
+    p[0] = 0x20
+    p[1] = 0x80
+    p[4:8] = struct.pack("<I", counter & 0xFFFFFFFF)
+    p[12:16] = struct.pack("<I", serial)
+    p[16:20] = SUBHDR
+    p[20:24] = struct.pack("<I", 8)             # селектор (как у N3000)
+    return seal(p)
+
+
+def parse_status(resp: bytes) -> dict:
+    """
+    Разбор ответа fn 0x21 (360 Б) от статуса/монитора:
+      clock         — часы контроллера (datetime|None)
+      last_index    — номер последней записи (из шапки [40:44])
+      events        — список недавних проходов (новейшие первыми)
+    Каждое событие: {index, card, dt(datetime), door, flag}.
+    """
+    import datetime as _dt
+    clock = None
+    try:  # [20:27] BCD: yy mm dd wd HH MM SS
+        b = resp[20:27]
+        clock = _dt.datetime(2000 + int(f"{b[0]:02x}"), int(f"{b[1]:02x}"), int(f"{b[2]:02x}"),
+                             int(f"{b[4]:02x}"), int(f"{b[5]:02x}"), int(f"{b[6]:02x}"))
+    except (ValueError, IndexError):
+        pass
+    last_index = struct.unpack("<I", resp[40:44])[0] if len(resp) >= 44 else 0
+    events = []
+    for off in range(_REC_OFF, len(resp) - _REC + 1, _REC):
+        r = resp[off:off + _REC]
+        idx = struct.unpack("<I", r[0:4])[0]
+        card = struct.unpack("<I", r[4:8])[0]
+        if idx == 0 or card == 0:
+            continue
+        dw, tw = r[12] | r[13] << 8, r[14] | r[15] << 8
+        y, m, d = dec_date(dw)
+        h, mi, s = dec_time(tw)
+        try:
+            when = _dt.datetime(y, m, d, h, mi, s)
+        except ValueError:
+            when = None
+        events.append({"index": idx, "card": card, "dt": when,
+                       "door": DOOR_BY_BYTE.get(r[16], r[16]),
+                       "b16": r[16], "b17": r[17], "flag": r[17]})
+    return {"clock": clock, "last_index": last_index, "events": events}
+
+
+def read_events(ip: str, serial: int, counter: int, timeout: float = 2.0):
+    """Опросить контроллер и вернуть parse_status(...) или None при таймауте."""
+    resp, _ = transact(ip, build_status(serial, counter), timeout)
+    return parse_status(resp) if resp else None
+
+
 # ---------------------------------------------------------------------- CLI
 def _date(s):
     y, m, d = map(int, s.split("-"))
@@ -157,9 +227,28 @@ def _main():
         print("  status   <ip> <serial>")
         print("  grant    <ip> <serial> <card> <activate ГГГГ-ММ-ДД> <deactivate ГГГГ-ММ-ДД> <двери,напр 1 или 1,2>")
         print("  prohibit <ip> <serial> <card>")
+        print("  events   <ip> <serial>            — живой монитор проходов (поллинг, Ctrl+C — стоп)")
         return
 
     cmd = a[0]
+    if cmd == "events":
+        import time
+        ip, serial = a[1], int(a[2])
+        print(f"Монитор проходов {ip} / {serial}. Ctrl+C — стоп.")
+        seen = None
+        while True:
+            st = read_events(ip, serial, _counter())
+            if st:
+                if seen is None:
+                    seen = st["last_index"]        # на старте только отмечаем позицию
+                for e in sorted((e for e in st["events"] if e["index"] > seen),
+                                key=lambda e: e["index"]):
+                    print(f"  №{e['index']} карта {e['card']} {e['dt']} "
+                          f"[16]=0x{e['b16']:02x} [17]=0x{e['b17']:02x}")
+                    seen = e["index"]
+            time.sleep(1)
+        return
+
     if cmd == "status":
         ip, serial = a[1], int(a[2])
         cnt = _counter()

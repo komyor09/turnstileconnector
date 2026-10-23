@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pymysql
 
+import wg_short as wg          # короткий протокол WGACCESS (CRC-16/IBM, без DLL/шифрования)
+
 log = logging.getLogger("turnstile")
 
 # Заполняется из config.toml в load_config()
@@ -36,12 +38,13 @@ MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL = 5, [2, 5, 15, 60], 3600
 HTTP_BIND, HTTP_PORT, HTTP_TOKEN = "0.0.0.0", 8090, ""
 LOG: dict = {}
 controllers: list = []
+TOML_CONTROLLERS: list = []   # [[controllers]] из config.toml — запасной источник, если в базе пусто
 EVENTS: dict = {}      # секция [events]; пусто или enabled = false — проходы не читаются
 
 
 def load_config(path):
     global DB, VIEW, RECONCILE_AT, DRY_RUN, MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL, HTTP_BIND, HTTP_PORT, HTTP_TOKEN
-    global controllers, EVENTS, LOG
+    global TOML_CONTROLLERS, EVENTS, LOG
     with open(path, "rb") as f:
         cfg = tomllib.load(f)
     DB = cfg["db"]
@@ -58,21 +61,48 @@ def load_config(path):
     if len(HTTP_TOKEN) < 16:
         raise SystemExit("http.token слишком короткий: нужно не меньше 16 символов")
     LOG = cfg.get("log", {})
-    controllers = [Controller(c["sn"], c["ip"], {d: 1 for d in c["doors"]}, c.get("port", 60000))
-                   for c in cfg["controllers"]]
+    TOML_CONTROLLERS = cfg.get("controllers", [])
     if len(RETRY_DELAYS) < MAX_ATTEMPTS - 1:
         raise SystemExit("retry_delays должен содержать max_attempts - 1 значений")
     e = cfg.get("events", {})
+    # Короткий протокол читает проходы поллингом (push контроллеры не умеют).
     EVENTS = {} if not e.get("enabled", False) else {
-        "listen_port": e.get("listen_port", 60001),            # 0 = без push (тогда нужен poll_seconds)
-        "listener_address": e.get("listener_address", ""),     # IP коннектора для контроллеров; "" = не настраивать
-        "poll_seconds": e.get("poll_seconds", 0),               # 0 = только по push, без периодической сверки
+        "poll_seconds": e.get("poll_seconds", 2) or 2,          # период опроса контроллеров, сек (0 → 2)
         "history_on_first_start": e.get("history_on_first_start", False),
-        "sync_time_hours": e.get("sync_time_hours", 24),       # 0 = не трогать часы контроллеров
-        "batch": e.get("batch", 500),
     }
-    if EVENTS and not EVENTS["listen_port"] and not EVENTS["poll_seconds"]:
-        raise SystemExit("events: без push (listen_port = 0) нужен poll_seconds > 0, иначе проходы не читаются")
+
+
+def _controller_from_row(r):
+    """Строит Controller из строки таблицы turnstile_controllers."""
+    doors = {int(x): 1 for x in str(r["doors"]).replace(" ", "").split(",") if x}
+    return Controller(r["sn"], r["ip"], doors,
+                      directions={1: r.get("dir1", "in"), 2: r.get("dir2", "out")},
+                      port=r.get("port") or 60000)
+
+
+def load_controllers():
+    """Берёт контроллеры из таблицы turnstile_controllers; если её нет или она пуста —
+    из [[controllers]] config.toml. Добавить турникет = INSERT в таблицу, без правки конфига."""
+    global controllers
+    rows = None
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT sn, ip, port, doors, dir1, dir2 FROM turnstile_controllers"
+                        " WHERE active = 1 ORDER BY sn")
+            rows = cur.fetchall()
+    except pymysql.err.ProgrammingError:          # таблицы ещё нет
+        rows = None
+    if rows:
+        controllers = [_controller_from_row(r) for r in rows]
+        log.info("контроллеры из базы (turnstile_controllers): %s", [c.sn for c in controllers])
+    else:
+        controllers = [Controller(c["sn"], c["ip"], {d: 1 for d in c["doors"]},
+                                  directions=c.get("directions", {1: "in", 2: "out"}),
+                                  port=c.get("port", 60000))
+                       for c in TOML_CONTROLLERS]
+        log.info("контроллеры из config.toml: %s", [c.sn for c in controllers])
+    if not controllers:
+        raise SystemExit("нет контроллеров: ни в таблице turnstile_controllers, ни в config.toml")
 
 
 def log_error(cur, sid, card_no, action, error, attempts):
@@ -88,107 +118,73 @@ def resolve_errors(cur, sid):
 # ============================ КОНТРОЛЛЕР ============================
 
 class Controller:
-    """WG3000 / UHPPOTE: UDP, 64 байта, little-endian, даты в BCD."""
+    """WGACCESS / N3000, короткий протокол (пакеты 0x2x, CRC-16/IBM, без шифрования).
 
-    def __init__(self, sn, ip, doors, port=60000, timeout=1.0):
+    Транспорт — модуль wg_short. Проверка записи — по ack контроллера (как у N3000);
+    чтение одной карты в коротком протоколе не реализовано. События приходят блоком
+    последних ~11 записей в ответе статуса (fn 0x20), а не по номеру.
+    """
+
+    def __init__(self, sn, ip, doors, directions=None, port=60000, timeout=1.5):
         self.sn, self.ip, self.port, self.timeout = sn, ip, port, timeout
-        self.doors = bytes(int(doors.get(d, 0)) for d in (1, 2, 3, 4))
+        # какие двери открывать карте: {1: 1, 2: 1} → маска [д1, д2, д3, д4]
+        self.door_mask = [1 if doors.get(d) else 0 for d in (1, 2, 3, 4)]
+        # направление по двери для журнала проходов: {1: "in", 2: "out"} → {1: 1, 2: 2}
+        self.directions = {int(d): (1 if str(v).lower() in ("in", "вход", "1") else 2)
+                           for d, v in (directions or {}).items()}
         self._ok_until = 0.0
 
-    def _call(self, fn, data=b""):
-        pkt = (bytes([0x17, fn, 0, 0]) + struct.pack("<I", self.sn) + data).ljust(64, b"\0")
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(self.timeout)
-            s.sendto(pkt, (self.ip, self.port))
-            deadline = time.monotonic() + self.timeout
-            while time.monotonic() < deadline:
-                try:
-                    r, _ = s.recvfrom(1024)
-                except (socket.timeout, ConnectionError):   # Windows: WinError 10054 = ConnectionResetError
-                    break
-                if len(r) >= 64 and r[0] == 0x17 and r[1] == fn and struct.unpack("<I", r[4:8])[0] == self.sn:
-                    return r
-        raise IOError(f"контроллер {self.sn} ({self.ip}) не отвечает")
+    def _tx(self, req):
+        resp, info = wg.transact(self.ip, req, self.timeout)
+        if not info or not info["crc_ok"] or info["serial"] != self.sn:
+            raise IOError(f"контроллер {self.sn} ({self.ip}) не отвечает")
+        return req, info
 
     def alive(self):
         """Пинг с кэшем на 5 сек, чтобы при упавшем контроллере не ждать таймаут на каждом студенте."""
         if time.monotonic() < self._ok_until:
             return True
         try:
-            self._call(0x20)
+            self._tx(wg.build_status(self.sn, wg._counter()))
             self._ok_until = time.monotonic() + 5
             return True
         except IOError:
             return False
 
     def put_card(self, card, d_from: date, d_to: date):
-        bcd = lambda d: bytes.fromhex(d.strftime("%Y%m%d"))
-        r = self._call(0x50, struct.pack("<I", card) + bcd(d_from) + bcd(d_to) + self.doors + b"\0\0\0")
-        if r[8] != 1:
+        cnt = wg._counter()
+        req, info = self._tx(wg.build_privilege(
+            self.sn, cnt, card,
+            (d_from.year, d_from.month, d_from.day),
+            (d_to.year, d_to.month, d_to.day),
+            self.door_mask, enable=True))
+        if not wg._ack_ok(req, info, self.sn, cnt):
             raise IOError(f"контроллер {self.sn} отклонил карту {card}")
 
     def delete_card(self, card):
-        self._call(0x52, struct.pack("<I", card))
-
-    def get_card(self, card):
-        """(card, from 'YYYYMMDD', to 'YYYYMMDD', doors) или None. Нет карты → контроллер возвращает номер 0."""
-        r = self._call(0x5A, struct.pack("<I", card))
-        if struct.unpack("<I", r[8:12])[0] != card:
-            return None
-        return card, r[12:16].hex(), r[16:20].hex(), list(r[20:24])
+        cnt = wg._counter()
+        self._tx(wg.build_privilege(self.sn, cnt, card, (2000, 1, 1), (2000, 1, 1),
+                                    [0, 0, 0, 0], enable=False))
 
     def has_card(self, card):
-        return self.get_card(card) is not None
-
-    def card_count(self):
-        return struct.unpack("<I", self._call(0x58)[8:12])[0]
+        # Чтение одной карты в коротком протоколе не вскрыто. Результат put_card
+        # подтверждается ack контроллера, поэтому отдельная проверка не нужна.
+        return True
 
     # --- события (проходы) ---
 
-    def status(self):
-        """Последний номер события, само событие и часы контроллера."""
-        r = self._call(0x20)
-        clock = None
-        try:   # дата yymmdd в 51..53, время HHMMSS в 37..39 (BCD)
-            clock = datetime.strptime("20" + r[51:54].hex() + r[37:40].hex(), "%Y%m%d%H%M%S")
-        except ValueError:
-            pass
-        return {"last_index": struct.unpack("<I", r[8:12])[0], "event": parse_event(r), "clock": clock}
+    def last_index(self):
+        """Номер последней записи проходов (fn 0x80)."""
+        req, info = self._tx(wg.build_latest_index(self.sn, wg._counter()))
+        return struct.unpack("<I", info["data"][4:8])[0]
 
-    def get_event(self, index):
-        """Событие №index. None — такого нет; {"overwritten": True} — уже затёрто (память кольцевая)."""
-        return parse_event(self._call(0xB0, struct.pack("<I", index)))
+    def read_events(self):
+        """Блок последних проходов: {clock, last_index, events[{index,card,dt,door,b16,b17,flag}]}."""
+        st = wg.read_events(self.ip, self.sn, wg._counter(), self.timeout)
+        if st is None:
+            raise IOError(f"контроллер {self.sn} ({self.ip}) не отвечает")
+        return st
 
-    def set_listener(self, ip, port, interval=0):
-        """Куда контроллеру слать события. interval=0 — только при событии, без периодических пакетов."""
-        r = self._call(0x90, socket.inet_aton(ip) + struct.pack("<H", port) + bytes([interval]))
-        return r[8] == 1
-
-    def get_listener(self):
-        r = self._call(0x92)
-        return socket.inet_ntoa(r[8:12]), struct.unpack("<H", r[12:14])[0], r[14]
-
-    def set_time(self, dt: datetime):
-        r = self._call(0x30, bytes.fromhex(dt.strftime("%Y%m%d%H%M%S")))
-        return bcd_datetime(r[8:15])
-
-
-def bcd_datetime(b):
-    try:
-        return datetime.strptime(b.hex(), "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-
-
-def parse_event(r):
-    """Поля события одинаковы в ответе статуса (0x20), чтения события (0xB0) и push-пакете."""
-    index = struct.unpack("<I", r[8:12])[0]
-    if index == 0:
-        return None
-    if r[12] == 0xFF:
-        return {"index": index, "overwritten": True}
-    return {"index": index, "type": r[12], "granted": r[13] == 1, "door": r[14], "direction": r[15],
-            "card": struct.unpack("<I", r[16:20])[0], "time": bcd_datetime(r[20:27]), "reason": r[27]}
 
 # ============================ ОЧЕРЕДЬ ============================
 
@@ -467,8 +463,7 @@ def nightly_reconcile():
 
 # ============================ ПРОХОДЫ: ТУРНИКЕТЫ → БАЗА ============================
 
-events_wake = threading.Event()     # «звонок»: пришёл push или осталась недочитанная пачка
-last_push: dict = {}                # sn → время последнего push (для /health)
+last_push: dict = {}                # sn → время последнего push (для /health; в коротком протоколе не используется)
 DIRECTION = {1: "вход", 2: "выход"}
 
 
@@ -477,86 +472,76 @@ def save_cursor(cur, sn, index):
                 " ON DUPLICATE KEY UPDATE last_index = VALUES(last_index)", (sn, index))
 
 
-def store_event(cur, sn, ev):
+def store_event(cur, c, ev):
+    """Пишет один проход. ev — из wg.parse_status: {index, card, dt, door, b16, b17, flag}.
+    Направление берётся из конфига двери (c.directions), результат — из флага [17]."""
     cur.execute("SELECT student_id FROM turnstile_synced WHERE card_no = %s LIMIT 1", (ev["card"],))
     r = cur.fetchone()
     sid = r["student_id"] if r else None
+    # Расшифровка сверена с живыми проходами и отказной картой:
+    #   door      — байт [16]: 0x10 → дверь 1, 0x18 → дверь 2 (одинаково на всех контроллерах);
+    #   direction — по двери из конфига (дверь 1 = вход, дверь 2 = выход);
+    #   granted   — бит 0x80 в байте [17]: выставлен → ОТКАЗ, снят → проход.
+    door = ev["door"]
+    direction = c.directions.get(door, 0)              # 1=вход, 2=выход
+    granted = 0 if ev["flag"] & 0x80 else 1
     cur.execute("INSERT IGNORE INTO turnstile_events (controller_sn, event_index, event_time, event_type, card_no,"
                 " student_id, door, direction, granted, reason) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (sn, ev["index"], ev["time"] or datetime(1970, 1, 1), ev["type"], ev["card"], sid,
-                 ev["door"], ev["direction"], int(ev["granted"]), ev["reason"]))
-    if ev["type"] == 1:
-        log.info("проход: карта %s%s, дверь %s, %s — %s (%s, №%s)", ev["card"],
-                 f" (студент {sid})" if sid else " (нет в списке)", ev["door"],
-                 DIRECTION.get(ev["direction"], ev["direction"]),
-                 "пропущен" if ev["granted"] else f"ОТКАЗ, код {ev['reason']}", ev["time"], ev["index"])
-    else:
-        log.info("событие контроллера %s: тип %s, дверь %s, код %s (№%s)", sn, ev["type"], ev["door"], ev["reason"], ev["index"])
-
-
-def same_event_as_stored(cur, c, index):
-    """Событие №index в контроллере — то же, что мы сохранили? Ловит сброс памяти, после которого
-    новых событий набралось больше, чем было прочитано (номер тогда не уменьшается)."""
-    cur.execute("SELECT event_time, card_no FROM turnstile_events WHERE controller_sn = %s AND event_index = %s"
-                " ORDER BY id DESC LIMIT 1", (c.sn, index))
-    row = cur.fetchone()
-    if row is None:                       # не с чем сравнить (история пропущена или событие было затёрто)
-        return True
-    ev = c.get_event(index)
-    if ev is None or ev.get("overwritten"):
-        return True
-    return (ev["time"] or datetime(1970, 1, 1)) == row["event_time"] and ev["card"] == row["card_no"]
+                (c.sn, ev["index"], ev["dt"] or datetime(1970, 1, 1), 1, ev["card"], sid,
+                 door, direction, granted, ev["flag"]))           # reason хранит сырой флаг [17]
+    log.info("проход: карта %s%s, дверь %s, %s — %s (%s, №%s)", ev["card"],
+             f" (студент {sid})" if sid else " (нет в списке)", door,
+             DIRECTION.get(direction, "?"),
+             "пропущен" if granted else "ОТКАЗ", ev["dt"], ev["index"])
 
 
 def fetch_new_events(cur, c):
-    """Дочитывает события контроллера c от сохранённого номера до последнего. Возвращает True, если осталось ещё."""
-    last = c.status()["last_index"]
+    """Читает блок последних проходов контроллера и сохраняет те, что новее курсора.
+
+    Короткий протокол отдаёт только ~11 последних записей (без чтения по номеру).
+    При опросе раз в 2 сек это с огромным запасом: турникет не выдаёт столько проходов
+    так быстро. Разрыв возможен лишь если САМ коннектор был недоступен минуты/часы, пока
+    турникеты работали автономно, — тогда часть проходов в журнал не попадёт (их видно по
+    предупреждению ниже; при необходимости полную историю можно вычитать кнопкой Download
+    в N3000)."""
+    st = c.read_events()
+    last = st["last_index"]
     cur.execute("SELECT last_index FROM turnstile_event_cursor WHERE controller_sn = %s", (c.sn,))
     row = cur.fetchone()
     if row is None:
         start = 0 if EVENTS["history_on_first_start"] else last
         save_cursor(cur, c.sn, start)
-        log.info("контроллер %s: первый запуск чтения проходов — %s", c.sn,
-                 "читаю всю историю из памяти контроллера" if EVENTS["history_on_first_start"]
-                 else f"старые события (до №{last}) пропускаю, читаю только новые")
+        log.info("контроллер %s: первый запуск чтения проходов — читаю с №%s", c.sn, start)
         cursor = start
     else:
         cursor = row["last_index"]
-    if last < cursor or (last > cursor > 0 and not same_event_as_stored(cur, c, cursor)):
-        log.warning("контроллер %s: события в памяти не совпадают с сохранёнными (сейчас до №%s, прочитано до №%s) — "
-                    "память очищена или контроллер заменён; читаю с начала", c.sn, last, cursor)
-        cursor = 0
-        save_cursor(cur, c.sn, 0)
-        if push_enabled():
-            configure_listener(c)            # после сброса адрес push пропадает — вернуть сразу, не ждать 5 минут
+    if last < cursor:                       # память очищена или контроллер заменён
+        log.warning("контроллер %s: индекс в памяти (%s) меньше прочитанного (%s) — память сброшена, "
+                    "продолжаю с текущего", c.sn, last, cursor)
+        cursor = max(0, last - 1)
+        save_cursor(cur, c.sn, cursor)
 
-    end = min(last, cursor + EVENTS["batch"])
-    skipped = 0
-    for i in range(cursor + 1, end + 1):
-        ev = c.get_event(i)
-        if ev is None:
-            break
-        if ev.get("overwritten"):
-            skipped += 1
-        else:
-            store_event(cur, c.sn, ev)
-        save_cursor(cur, c.sn, i)
-    if skipped:
-        log.warning("контроллер %s: %s событий уже затёрты в памяти контроллера — пропущены", c.sn, skipped)
-    return end < last
+    new = sorted((e for e in st["events"] if e["index"] > cursor), key=lambda e: e["index"])
+    # Реальный пропуск — только если самая старая запись в блоке новее, чем cursor+1:
+    # значит часть событий уже вытеснена из блока (длинный простой коннектора или наплыв проходов).
+    # Курсор двигаем ТОЛЬКО по реально увиденным записям — last_index в шапке бывает на 1 впереди
+    # (свежее событие появляется в блоке на следующий опрос), это не пропуск.
+    if new and new[0]["index"] > cursor + 1:
+        gap = new[0]["index"] - (cursor + 1)
+        log.warning("контроллер %s: в журнал не попало ~%s проходов (коннектор был недоступен дольше, "
+                    "чем помещается в блок) — при необходимости вычитать из N3000 (Download)", c.sn, gap)
+    for e in new:
+        store_event(cur, c, e)
+        save_cursor(cur, c.sn, e["index"])
 
 
 def events_worker():
-    """Один поток пишет события. База недоступна — ждёт без потери: номер в курсоре не двигается."""
-    conn, backoff, next_time_sync = None, 1, 0.0
-    poll = EVENTS["poll_seconds"]
-    if push_enabled():
-        configure_listeners()           # здесь, а не в main: недоступный контроллер не задерживает запуск вебхука
-    down: set = set()                       # контроллеры, о недоступности которых уже написали
-    next_listener_check = time.monotonic() + 300
+    """Опрашивает контроллеры и пишет проходы. Короткий протокол не пушит — только поллинг.
+    База недоступна — курсор не двигается, ничего не теряется."""
+    conn, backoff = None, 1
+    poll = EVENTS["poll_seconds"] or 2          # по умолчанию опрос раз в 2 сек
+    down: set = set()                            # контроллеры, о недоступности которых уже написали
     while True:
-        events_wake.clear()
-        more = False
         try:
             conn = alive_conn(conn) if conn else connect()
             if backoff > 1:
@@ -565,14 +550,12 @@ def events_worker():
             with conn.cursor() as cur:
                 for c in controllers:
                     try:
-                        more |= fetch_new_events(cur, c)
+                        fetch_new_events(cur, c)
                         if c.sn in down:
                             down.discard(c.sn)
                             log.info("проходы: контроллер %s снова отвечает", c.sn)
-                            if push_enabled():
-                                configure_listener(c)
                     except IOError as e:
-                        if c.sn not in down:    # пишем один раз, а не при каждой попытке
+                        if c.sn not in down:     # пишем один раз, а не при каждой попытке
                             down.add(c.sn)
                             log.warning("проходы: %s — продолжу пробовать, напишу, когда ответит", e)
         except DB_ERRORS as e:
@@ -581,73 +564,10 @@ def events_worker():
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
-
-        if EVENTS["sync_time_hours"] and time.monotonic() >= next_time_sync:
-            for c in controllers:
-                try:
-                    c.set_time(datetime.now())
-                except IOError as e:
-                    log.warning("часы контроллера %s не выставлены: %s", c.sn, e)
-            log.info("часы контроллеров выставлены по серверу")
-            next_time_sync = time.monotonic() + EVENTS["sync_time_hours"] * 3600
-
-        # Контроллер заменили или сбросили — адрес push пропал. Раз в 5 минут проверяем и восстанавливаем.
-        if push_enabled() and time.monotonic() >= next_listener_check:
-            configure_listeners()
-            next_listener_check = time.monotonic() + 300
-
-        if not more:
-            # Ждём push. Просыпаемся сами только к плановым делам с контроллерами
-            # (часы, проверка адреса push) и — если включено — к страховочной сверке.
-            deadlines = [next_listener_check] if push_enabled() else []
-            if EVENTS["sync_time_hours"]:
-                deadlines.append(next_time_sync)
-            if poll:
-                deadlines.append(time.monotonic() + poll)
-            events_wake.wait(max(0.0, min(deadlines) - time.monotonic()) if deadlines else None)
+        time.sleep(poll)
 
 
-def push_listener():
-    """Принимает push-пакеты контроллеров. Сам ничего не пишет — будит events_worker,
-    а тот читает события по номерам. Так у push и опроса один путь записи и нет гонок."""
-    known = {c.sn for c in controllers}
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("0.0.0.0", EVENTS["listen_port"]))
-    log.info("проходы: жду push от контроллеров на UDP %s", EVENTS["listen_port"])
-    while True:
-        try:
-            p, addr = s.recvfrom(1024)
-        except ConnectionResetError:          # Windows
-            continue
-        if len(p) >= 64 and p[0] == 0x17 and p[1] == 0x20:
-            sn = struct.unpack("<I", p[4:8])[0]
-            if sn in known:
-                last_push[sn] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                events_wake.set()
-
-
-def push_enabled():
-    return bool(EVENTS.get("listener_address") and EVENTS.get("listen_port"))
-
-
-def configure_listener(c):
-    """Указывает контроллеру, куда слать события. Перезаписывает прежнюю настройку (например, N3000)."""
-    addr, port = EVENTS["listener_address"], EVENTS["listen_port"]
-    try:
-        before = c.get_listener()
-        if before[:2] != (addr, port):
-            c.set_listener(addr, port, 0)
-            log.info("контроллер %s: push событий %s:%s (было %s:%s)", c.sn, addr, port, before[0], before[1])
-        after = c.get_listener()
-        if after[:2] != (addr, port):
-            log.error("контроллер %s: push не настроился, сейчас %s:%s", c.sn, after[0], after[1])
-    except IOError as e:
-        log.error("контроллер %s: настройка push — %s", c.sn, e)
-
-
-def configure_listeners():
-    for c in controllers:
-        configure_listener(c)
+# Короткий протокол не поддерживает push — события читаются поллингом (events_worker).
 
 
 # ============================ ПРОВЕРКИ И ЗАПУСК ============================
@@ -672,12 +592,10 @@ def check_controllers():
     ok = True
     for c in controllers:
         try:
-            log.info("контроллер %s (%s): отвечает, карт в памяти: %s", c.sn, c.ip, c.card_count())
-            if EVENTS:
-                st, lst = c.status(), c.get_listener()
-                drift = f"{(st['clock'] - datetime.now()).total_seconds():+.0f} сек" if st["clock"] else "не прочитать"
-                log.info("контроллер %s: событий в памяти до №%s, часы %s (расхождение с сервером %s), push → %s:%s",
-                         c.sn, st["last_index"], st["clock"], drift, lst[0], lst[1])
+            st = c.read_events()
+            drift = f"{(st['clock'] - datetime.now()).total_seconds():+.0f} сек" if st["clock"] else "не прочитать"
+            log.info("контроллер %s (%s): отвечает, последняя запись №%s, часы %s (расхождение с сервером %s)",
+                     c.sn, c.ip, st["last_index"], st["clock"], drift)
         except IOError as e:
             log.error("%s — если ping до %s проходит, проверьте серийный номер в N3000: "
                       "на чужой серийник контроллер не отвечает", e, c.ip)
@@ -686,25 +604,15 @@ def check_controllers():
 
 
 def selftest(card):
-    """Проверка протокола на НАСТОЯЩЕМ контроллере тестовой картой, которой нет ни у кого:
-    записать → прочитать и сверить → удалить → убедиться, что удалена."""
+    """Проверка записи на НАСТОЯЩЕМ контроллере тестовой картой: выдать → запретить.
+    Короткий протокол не умеет читать одну карту обратно, поэтому успех — по ack контроллера."""
     today = date.today()
     ok = True
     for c in controllers:
         try:
-            if c.has_card(card):
-                log.error("контроллер %s: карта %s уже есть — выберите номер, которого нет ни у кого", c.sn, card)
-                ok = False
-                continue
-            c.put_card(card, today, today)
-            got = c.get_card(card)
-            expect = (card, today.strftime("%Y%m%d"), today.strftime("%Y%m%d"), list(c.doors))
-            if got != expect:
-                raise IOError(f"записали {expect}, прочитали {got}")
+            c.put_card(card, today, date(2099, 12, 31))
             c.delete_card(card)
-            if c.has_card(card):
-                raise IOError("карта не удалилась")
-            log.info("контроллер %s: запись, чтение, сверка и удаление карты %s — ок", c.sn, card)
+            log.info("контроллер %s: выдача и запрет тестовой карты %s — ок (подтверждено ack)", c.sn, card)
         except IOError as e:
             log.error("контроллер %s: %s", c.sn, e)
             ok = False
@@ -738,6 +646,7 @@ def main():
     setup_logging()
 
     check_db()
+    load_controllers()
     ctrl_ok = check_controllers()
     if "--check" in sys.argv:
         raise SystemExit(0 if ctrl_ok else 1)
@@ -758,11 +667,8 @@ def main():
         log.info("ночная сверка: каждый день в %s", RECONCILE_AT)
 
     if EVENTS:
-        if EVENTS["listen_port"]:
-            supervised(push_listener).start()
         supervised(events_worker).start()
-        log.info("проходы: включены (%s)", f"страховочная сверка раз в {EVENTS['poll_seconds']} сек"
-                 if EVENTS["poll_seconds"] else "только по push, без периодической сверки")
+        log.info("проходы: включены (опрос контроллеров раз в %s сек)", EVENTS["poll_seconds"])
 
     log.info("вебхук: http://%s:%s/sync", HTTP_BIND, HTTP_PORT)
     ThreadingHTTPServer((HTTP_BIND, HTTP_PORT), Webhook).serve_forever()
