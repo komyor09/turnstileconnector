@@ -15,9 +15,7 @@ param(
     [Parameter(Mandatory = $true)][string]$IsuServerIp,       # кому разрешён вебхук (веб-сервер ISU)
     [string]$ServiceName    = "TurnstileConnector",
     [string]$Nssm           = "",
-    [int]   $HttpPort       = 8090,
-    [int]   $PushPort       = 60001,
-    [string]$ControllersNet = "192.168.140.0/24"
+    [int]   $HttpPort       = 8090
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -67,12 +65,10 @@ if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
 & $Nssm set $ServiceName AppExit Default Restart | Out-Null
 & $Nssm set $ServiceName AppRestartDelay 5000 | Out-Null
 
-Write-Host "4/4  Брандмауэр: вебхук только с $IsuServerIp, push только из $ControllersNet"
+Write-Host "4/4  Брандмауэр: вебхук только с $IsuServerIp (проходы коннектор забирает сам, входящий порт не нужен)"
 Get-NetFirewallRule -DisplayName "TurnstileConnector *" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 New-NetFirewallRule -DisplayName "TurnstileConnector webhook" -Direction Inbound -Protocol TCP `
     -LocalPort $HttpPort -RemoteAddress $IsuServerIp -Action Allow -Profile Any | Out-Null
-New-NetFirewallRule -DisplayName "TurnstileConnector push" -Direction Inbound -Protocol UDP `
-    -LocalPort $PushPort -RemoteAddress $ControllersNet -Action Allow -Profile Any | Out-Null
 
 & $Nssm start $ServiceName | Out-Null
 Start-Sleep -Seconds 3
