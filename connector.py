@@ -36,6 +36,8 @@ RECONCILE_AT = ""      # "03:00" — полная сверка раз в сут�
 DRY_RUN = False
 MAX_ATTEMPTS, RETRY_DELAYS, AFTER_FAIL = 5, [2, 5, 15, 60], 3600
 HTTP_BIND, HTTP_PORT, HTTP_TOKEN = "0.0.0.0", 8090, ""
+API_KEY = ""           # X-API-Key для эндпоинтов записи в api.py; пусто — запись запрещена
+ROOT_PATH = ""         # префикс за nginx (напр. /turnstile); Swagger на <root>/docs
 LOG: dict = {}
 controllers: list = []
 TOML_CONTROLLERS: list = []   # [[controllers]] из config.toml — запасной источник, если в базе пусто
@@ -71,6 +73,51 @@ def load_config(path):
         "history_on_first_start": e.get("history_on_first_start", False),
         "mdb_path": e.get("mdb_path", ""),                      # файл N3000 Download для суточной сверки; "" — выкл.
     }
+
+
+def configure(path=None):
+    """Единая загрузка конфига для обеих систем.
+      Windows: есть config.toml → он база, env перекрывает заданные переменные.
+      Docker:  config.toml нет → всё из переменных окружения (settings.py).
+    Пароли берутся из env/.env и в образ/гит не попадают."""
+    global DB, VIEW, RECONCILE_AT, DRY_RUN, HTTP_TOKEN, LOG, EVENTS, API_KEY, ROOT_PATH
+    from settings import Settings, db_dict
+    have_toml = bool(path and os.path.exists(path))
+    if have_toml:
+        load_config(path)                       # TOML как база
+    s = Settings()                               # env (+ .env)
+    env = s.model_fields_set                     # какие поля реально заданы в окружении
+    use = (lambda f: True) if not have_toml else (lambda f: f in env)   # без TOML env задаёт всё
+
+    if not have_toml:
+        DB = db_dict(s)
+    else:
+        for ef, dk in (("db_host", "host"), ("db_port", "port"), ("db_user", "user"),
+                       ("db_password", "password"), ("db_name", "database"), ("db_charset", "charset")):
+            if ef in env:
+                DB[dk] = getattr(s, ef)
+    if use("sync_view"):
+        VIEW = s.sync_view
+    if use("dry_run"):
+        DRY_RUN = s.dry_run
+    if use("reconcile_at"):
+        RECONCILE_AT = s.reconcile_at
+        if RECONCILE_AT:
+            datetime.strptime(RECONCILE_AT, "%H:%M")
+    if use("http_token"):
+        HTTP_TOKEN = s.http_token or ""
+    if use("api_key"):
+        API_KEY = s.api_key or ""
+    if use("root_path"):
+        ROOT_PATH = s.root_path
+    if use("log_file"):
+        LOG = {"file": s.log_file, "max_mb": s.log_max_mb, "keep": s.log_keep} if s.log_file else {}
+    if use("events_enabled"):
+        EVENTS = {} if not s.events_enabled else {
+            "poll_seconds": s.poll_seconds or 2,
+            "history_on_first_start": s.history_on_first_start,
+            "mdb_path": s.mdb_path,
+        }
 
 
 def _controller_from_row(r):
@@ -234,6 +281,7 @@ class Queue:
 
 
 queue = Queue()
+STOP = threading.Event()        # ставится при штатной остановке (lifespan shutdown) — фон выходит без падения
 
 # ============================ СИНХРОНИЗАЦИЯ ============================
 
@@ -381,7 +429,8 @@ def supervised(target, *args):
         except BaseException:
             log.exception("поток %s упал — перезапуск процесса", target.__name__)
         finally:
-            os._exit(1)
+            if not STOP.is_set():          # штатная остановка (STOP) — не роняем процесс
+                os._exit(1)
     return threading.Thread(target=run, name=target.__name__, daemon=True)
 
 
@@ -451,12 +500,13 @@ def enqueue_all(force=False, delay=0.0):
 def nightly_reconcile():
     """Раз в сутки в RECONCILE_AT — полная сверка (страховка, если изменение прошло мимо вебхука)."""
     hh, mm = map(int, RECONCILE_AT.split(":"))
-    while True:
+    while not STOP.is_set():
         now = datetime.now()
         at = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if at <= now:
             at += timedelta(days=1)
-        time.sleep((at - now).total_seconds())
+        if STOP.wait((at - now).total_seconds()):   # проснулись из-за остановки — выходим
+            return
         try:
             log.info("ночная сверка: %s студентов в очереди", enqueue_all())
         except DB_ERRORS as e:
@@ -548,7 +598,7 @@ def events_worker():
     conn, backoff = None, 1
     poll = EVENTS["poll_seconds"] or 2          # по умолчанию опрос раз в 2 сек
     down: set = set()                            # контроллеры, о недоступности которых уже написали
-    while True:
+    while not STOP.is_set():
         try:
             conn = alive_conn(conn) if conn else connect()
             if backoff > 1:
@@ -568,10 +618,10 @@ def events_worker():
         except DB_ERRORS as e:
             log.error("проходы: база недоступна (%s) — повтор через %s сек", e, backoff)
             conn = None
-            time.sleep(backoff)
+            STOP.wait(backoff)
             backoff = min(backoff * 2, 60)
             continue
-        time.sleep(poll)
+        STOP.wait(poll)
 
 
 # Короткий протокол не поддерживает push — события читаются поллингом (events_worker).
@@ -585,7 +635,7 @@ def reconcile_events_mdb(path):
     directions = {c.sn: c.directions for c in controllers}
     known = {c.sn for c in controllers}
     with connect() as conn:
-        rows = mdb_reconcile.read_swipes_odbc(path)
+        rows = mdb_reconcile.read_swipes(path)
         added, existed = mdb_reconcile.reconcile(conn, rows, directions, known_sns=known)
     log.info("сверка из %s: добавлено %s проходов, уже было %s", path, added, existed)
     return added
@@ -663,7 +713,8 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     os.chdir(os.path.dirname(os.path.abspath(__file__)))   # служба стартует в system32 — работаем из папки проекта
     args = [a for a in sys.argv[1:] if not a.startswith("--") and not a.isdigit()]
-    load_config(args[0] if args else "config.toml")
+    cfg = args[0] if args else "config.toml"
+    configure(cfg if os.path.exists(cfg) else None)   # TOML если есть, иначе env (Docker)
     setup_logging()
 
     check_db()
@@ -684,22 +735,30 @@ def main():
     if DRY_RUN:
         log.warning("РЕЖИМ DRY-RUN: на контроллеры ничего не отправляется, только лог")
 
-    # При запуске — полная сверка: догоняем всё, что изменилось, пока коннектор был выключен
-    # или пока вызовы вебхука не доходили.
     force = "--force" in sys.argv
+    start_workers(force)
+    log.info("вебхук: http://%s:%s/sync", HTTP_BIND, HTTP_PORT)
+    ThreadingHTTPServer((HTTP_BIND, HTTP_PORT), Webhook).serve_forever()
+
+
+def start_workers(force=False):
+    """Старт фоновых потоков (очередь карт, опрос проходов, ночная сверка) и стартовая сверка.
+    Зовётся и из main() (headless), и из lifespan api.py. Ровно один вызов на процесс."""
+    STOP.clear()
     log.info("стартовая сверка%s: %s студентов в очереди",
              " (--force: переписать все карты)" if force else "", enqueue_all(force))
     supervised(worker).start()
     if RECONCILE_AT:
         supervised(nightly_reconcile).start()
         log.info("ночная сверка: каждый день в %s", RECONCILE_AT)
-
     if EVENTS:
         supervised(events_worker).start()
         log.info("проходы: включены (опрос контроллеров раз в %s сек)", EVENTS["poll_seconds"])
 
-    log.info("вебхук: http://%s:%s/sync", HTTP_BIND, HTTP_PORT)
-    ThreadingHTTPServer((HTTP_BIND, HTTP_PORT), Webhook).serve_forever()
+
+def stop_workers():
+    """Штатная остановка фона (lifespan shutdown): опрос/сверка выходят из циклов."""
+    STOP.set()
 
 
 if __name__ == "__main__":

@@ -1,2 +1,5 @@
 pymysql>=1.1
-pyodbc>=5.0   ; sys_platform == "win32"   # для суточной сверки проходов из .mdb (Access-драйвер)
+construct>=2.10        # вложенный access_parser (чтение .mdb N3000 без ODBC/пароля)
+fastapi>=0.110        # Swagger/REST управление (api.py)
+uvicorn[standard]>=0.29
+pydantic-settings>=2.0 # конфиг через переменные окружения (settings.py) — для Docker

@@ -1,10 +1,30 @@
-.venv
-.idea
+# Не класть в образ: окружение, секреты, логи, Windows-специфика, отладку.
 .git
+.gitignore
+.venv
+venv
 __pycache__
-configвввв.toml
-config.test.toml
-*.sql
-README.md
+*.pyc
+*.pyo
+
+# Секреты и локальный конфиг — задаются через --env-file, в образ не попадают
+.env
+config.toml
+logs/
+*.log
+
+# Windows-специфика (в Linux-образе не нужна)
+*.dll
+*.exe
+*.ps1
+
+# Отладка/заглушки/вспомогательное — в проде не запускается
+probe.py
 fake_controller.py
-uv.lock
+php/
+tests/
+
+# Документация и примеры образу не нужны
+DEPLOY.md
+README.md
+*.md
