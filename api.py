@@ -108,6 +108,93 @@ def health():
             "controllers": [{"sn": c.sn, "ip": c.ip, "alive": c.alive()} for c in C.controllers]}
 
 
+def _as_int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/check", tags=["Статус"])
+def check(student_id: Optional[int] = None, card_no: Optional[int] = None, passes: int = 10):
+    """Диагностика по студенту (открыто на чтение). Укажите student_id ИЛИ card_no.
+
+    Отвечает на вопрос «работает ли турникет для этого студента»: есть ли доступ во вьюхе,
+    синхронизирован ли на турникеты, отвечают ли контроллеры и были ли реальные проходы.
+    Примечание: отдельного запроса «есть ли карта на контроллере» в коротком протоколе нет,
+    поэтому факт работы подтверждается учётом (ack при заливке) и реальными проходами."""
+    if student_id is None and card_no is None:
+        raise HTTPException(400, "укажите student_id или card_no")
+
+    with C.connect() as conn, conn.cursor() as cur:
+        # 1) источник (вьюха) — должен ли иметь доступ
+        if student_id is not None:
+            cur.execute(f"SELECT student_id, card_no, valid_from, valid_to FROM {C.VIEW}"
+                        " WHERE student_id=%s LIMIT 1", (student_id,))
+        else:
+            cur.execute(f"SELECT student_id, card_no, valid_from, valid_to FROM {C.VIEW}"
+                        " WHERE card_no=%s LIMIT 1", (card_no,))
+        in_view = cur.fetchone()
+        if in_view and student_id is None:
+            student_id = in_view["student_id"]
+
+        # 2) учёт коннектора — что залито на турникеты
+        on_sync = None
+        if student_id is not None:
+            cur.execute("SELECT student_id, card_no, valid_from, valid_to, synced_at"
+                        " FROM turnstile_synced WHERE student_id=%s", (student_id,))
+            on_sync = cur.fetchone()
+
+        # 3) последние проходы — реальное доказательство
+        last = []
+        if passes and student_id is not None:
+            cur.execute("SELECT event_time, card_no, direction, granted, door, controller_sn"
+                        " FROM v_turnstile_passes WHERE student_id=%s"
+                        " ORDER BY event_time DESC LIMIT %s", (student_id, min(passes, 100)))
+            last = cur.fetchall()
+
+    # карта, по которой судим: приоритет — вьюха, потом учёт, потом запрос
+    card = _as_int(in_view["card_no"]) if in_view else None
+    card = card or (_as_int(on_sync["card_no"]) if on_sync else None) or card_no
+
+    # 4) живой опрос контроллеров (отвечают ли сейчас)
+    ctrls = [{"sn": c.sn, "ip": c.ip, "alive": c.alive()} for c in C.controllers]
+    any_down = any(not c["alive"] for c in ctrls)
+
+    # 5) вердикт
+    have_access = bool(in_view and _as_int(in_view["card_no"]))
+    synced = bool(on_sync and _as_int(on_sync["card_no"]))
+    card_match = bool(in_view and on_sync and _as_int(in_view["card_no"]) == _as_int(on_sync["card_no"]))
+    has_pass = any(p["granted"] for p in last)
+
+    note = None
+    if not have_access and in_view:
+        verdict = "нет доступа: студент во вьюхе есть, но карта не привязана (card_no пуст/0)"
+    elif not in_view and not on_sync:
+        verdict = "не найден: ни во вьюхе, ни в учёте турникетов"
+    elif not have_access and not in_view and on_sync:
+        verdict = "снят с доступа во вьюхе, но ещё числится на турникетах — запусти /sync"
+    elif have_access and not synced:
+        verdict = "не синхронизирован: во вьюхе есть, на турникеты ещё не залит — запусти /sync"
+    elif have_access and synced and not card_match:
+        verdict = "рассинхрон: во вьюхе и в учёте разные карты — запусти /sync"
+        note = f"вьюха: {in_view['card_no']}, учёт: {on_sync['card_no']}"
+    elif has_pass:
+        verdict = "работает: синхронизирован, есть реальные проходы"
+    elif synced:
+        verdict = "синхронизирован, проходов пока нет" + (" (есть недоступные контроллеры)" if any_down else "")
+    else:
+        verdict = "состояние неопределённое"
+
+    if any_down and not note:
+        note = "часть контроллеров сейчас недоступна — проверка неполная"
+
+    return {"student_id": student_id, "card_no": card,
+            "доступ_по_вьюхе": in_view, "в_учёте": on_sync,
+            "контроллеры": ctrls, "последние_проходы": last,
+            "вердикт": verdict, "примечание": note}
+
+
 # ------------------------------------------------------------ контроллеры
 @app.get("/controllers", tags=["Контроллеры"], dependencies=[Depends(require_key)])
 def list_controllers(conn=Depends(db)):
